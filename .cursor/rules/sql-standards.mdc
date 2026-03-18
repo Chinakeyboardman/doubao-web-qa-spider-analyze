@@ -1,0 +1,24 @@
+---
+description: SQL 和数据库表设计规范
+globs: "**/*.sql"
+alwaysApply: false
+---
+
+# SQL 规范
+
+## 表命名
+
+- 新业务表必须加 `qa_` 前缀：`qa_query`、`qa_answer`、`qa_link`、`qa_link_content`
+- `douyin-crawler` 原有表（`douyin_videos` 等）不可修改
+
+## 建表要求
+
+- 使用 `CREATE TABLE IF NOT EXISTS`（幂等）
+- 每张表必须有 `created_at` 和 `updated_at` 字段
+- 为 `updated_at` 创建自动更新触发器
+- 外键关联使用 `ON DELETE CASCADE`
+
+## 索引
+
+- 使用 `CREATE INDEX IF NOT EXISTS`
+- 常用查询字段建索引（query_id、link_id、platform、content_format）

@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  # ---------- PostgreSQL ----------
+  postgres:
+    image: postgres:16-alpine
+    container_name: doubao-postgres
+    restart: always
+    ports:
+      - "${PGPORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-doubao}
+      POSTGRES_USER: ${PGUSER:-postgres}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-postgres}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # 初始化脚本：PG 首次启动时自动执行
+      - ./douyin-crawler/init-db.js:/docker-entrypoint-initdb.d/.skip_js:ro
+      - ./init-db/init.sql:/docker-entrypoint-initdb.d/02-init-qa-tables.sql:ro
+
+  # ---------- Redis ----------
+  redis:
+    image: redis:7-alpine
+    container_name: doubao-redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+  # ---------- 抖音视频下载 API（独立部署） ----------
+  douyin-download-api:
+    image: evil0ctal/douyin_tiktok_download_api
+    container_name: doubao-douyin-download-api
+    restart: always
+    ports:
+      - "${DOUYIN_DOWNLOAD_API_PORT:-8080}:80"
+    volumes:
+      - ./Douyin_TikTok_Download_API/crawlers/douyin/web/config.yaml:/app/crawlers/douyin/web/config.yaml:ro
+      - ./Douyin_TikTok_Download_API/crawlers/tiktok/web/config.yaml:/app/crawlers/tiktok/web/config.yaml:ro
+      - ./Douyin_TikTok_Download_API/crawlers/tiktok/app/config.yaml:/app/crawlers/tiktok/app/config.yaml:ro
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+
+volumes:
+  pg_data:

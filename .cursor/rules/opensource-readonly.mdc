@@ -1,0 +1,15 @@
+---
+description: 禁止修改开源项目目录中的文件
+globs: "{douyin-crawler/**,Douyin_TikTok_Download_API/**}"
+alwaysApply: false
+---
+
+# 开源项目只读
+
+这两个目录是拉取的开源项目，**严禁修改其中任何文件**：
+
+- `douyin-crawler/` — 豆包 web 爬虫
+- `Douyin_TikTok_Download_API/` — 抖音视频下载 API
+
+如需适配业务逻辑，在 `integration/` 目录中编写包装代码。
+如需调用其功能，通过 HTTP API 或在外部 import 其模块。

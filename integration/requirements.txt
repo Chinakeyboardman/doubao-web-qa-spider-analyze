@@ -1,0 +1,2 @@
+# integration 模块依赖
+python-dotenv>=1.0.0

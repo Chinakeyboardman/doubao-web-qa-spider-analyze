@@ -1,0 +1,102 @@
+---
+description: 豆包 QA 采集 Pipeline 数据流、格式规范与开发指引
+alwaysApply: true
+---
+
+# 豆包 QA Pipeline 开发指引
+
+> 详细文档见 `docs/` 目录：PIPELINE_DEV_DOC.md、大规模qa数据获取.md、PARSING_ROUTING.md
+
+## 一、Pipeline 主流程（4 步）
+
+```
+Step 1 Collect → Step 2 Crawl → Step 2.5 Enrich → Step 3 Structure
+   qa_answer       qa_link_content    (抖音 DB 补全)    content_json 规范化
+   qa_link         (raw JSONB)                          (格式 A/B/C/D)
+```
+
+| 步骤 | 入口 | 输入 | 输出 |
+|------|------|------|------|
+| Collect | `integration/doubao_web_collector.py` (Web) / `doubao_query.py` (API) | qa_query (pending) | qa_answer + qa_link |
+| Crawl | `web-crawler/crawler_manager.py` | qa_link (pending) | qa_link_content (raw_json) |
+| Enrich | `integration/douyin_data_merger.py` | qa_link_content (抖音) | 从 douyin_videos/douyin_comments 补全 |
+| Structure | `data-clean/structurer.py` | qa_link_content | content_json (格式 A/B/C/D) |
+
+**CLI 入口**：`python integration/run.py` — 子命令 `run` / `collect` / `crawl` / `enrich-douyin` / `structure` / `status` / `retry` / `export`
+
+---
+
+## 二、内容格式规范（严格遵循 docs/大规模qa数据获取.md）
+
+| 格式 | 适用平台 | 结构要点 |
+|------|----------|----------|
+| **A** | 抖音图文、小红书 | 标题 + 正文(段落) + 图片(独立) + 标签 + 评论 |
+| **B** | 知乎、什么值得买、通用 | 标题 + 内容流(文本与图片有序交错) + 小标题 |
+| **C** | 视频有字幕 | 视频标题 + 简介 + 字幕内容 + 评论 |
+| **D** | 视频无字幕 | 视频标题 + 简介 + STT待处理标记 + 评论 |
+
+- 商品页（淘宝/京东）：仅落 qa_link，**不抓取** qa_link_content
+- `ContentStructurer` 在 `data-clean/structurer.py`，按 `content_format` 选择格式
+
+---
+
+## 三、平台路由（docs/PARSING_ROUTING.md）
+
+| 平台 | 爬虫 | 文件 | 数据源 |
+|------|------|------|--------|
+| 抖音 | DouyinVideoCrawler | `web-crawler/crawlers/douyin_video.py` | 8080 API → douyin_videos 回退 |
+| B站 | BilibiliCrawler | `web-crawler/crawlers/bilibili_video.py` | 8080 API |
+| 小红书 | XiaohongshuCrawler | `web-crawler/crawlers/xiaohongshu.py` | httpx + SSR `__INITIAL_STATE__` |
+| 通用 | GenericWebCrawler | `web-crawler/crawlers/generic_web.py` | httpx + BeautifulSoup |
+| 淘宝/京东 | skip | — | 仅记录链接 |
+
+**扩展新平台**：在 `citation_parser.PLATFORM_RULES` 加域名，在 `parsing_routing.PLATFORM_PARSING_STRATEGY` 指定解析方式，实现 `BaseCrawler` 并注册到 `CrawlerManager`
+
+---
+
+## 四、关键代码位置
+
+| 功能 | 文件 |
+|------|------|
+| 平台识别 | `integration/citation_parser.py` — `identify_platform`, `PLATFORM_RULES` |
+| 解析策略 | `integration/parsing_routing.py` — `get_parsing_strategy` |
+| 爬虫调度 | `web-crawler/crawler_manager.py` — 按 platform 分发 |
+| 豆包 Web 采集 | `integration/doubao_web_collector.py` — Playwright + SMS 登录 |
+| 豆包 API 采集 | `integration/doubao_query.py` — 火山云 ARK API |
+| 抖音数据补全 | `integration/douyin_data_merger.py` — video_id 匹配 douyin_videos |
+| LLM 后处理 | `data-clean/llm_extractor.py` — 抖音 seedance、通用摘要、图片描述 |
+
+---
+
+## 五、LLM 调用点
+
+| # | 位置 | 模型 | 用途 |
+|---|------|------|------|
+| 1 | doubao_query.py | seed_model | 生成回答（API 模式） |
+| 2 | llm_extractor.py | seedance_model | 抖音视频文案特征 |
+| 3 | llm_extractor.py | seed_model | 通用网页摘要 |
+| 4 | llm_extractor.py | vision_model | 图片描述（可选） |
+
+---
+
+## 六、开发约定
+
+- **路径**：统一用 `pathlib.Path` 或 `os.path.join`，避免平台相关逻辑
+- **配置**：根目录 `.env`，`shared/config.py` 加载
+- **SMS 登录**：手机号需去除 `+86` 前缀；验证码接口需等待 45s 后重试
+- **抖音 URL**：支持 `douyin.com/video/`、`iesdouyin.com/share/video/`、`v.douyin.com` 短链
+- **质量保护**：爬虫写入前做 `_content_quality_score`，空壳数据不覆盖旧数据
+
+---
+
+## 七、文档索引
+
+| 文档 | 用途 |
+|------|------|
+| `docs/CHECKLIST.md` | 项目进度、阶段、子项目清单 |
+| `docs/PIPELINE_DEV_DOC.md` | Pipeline 步骤、技术栈、CLI、Schema、性能 |
+| `docs/大规模qa数据获取.md` | 数据模型、JSON 格式 A/B/C/D 完整定义 |
+| `docs/PARSING_ROUTING.md` | 平台解析路由、扩展方式 |
+| `docs/方案设计.md` | 子项目设计、Langchain/火山云选型 |
+| `docs/跨平台兼容性分析.md` | macOS/Linux/Windows 兼容性 |
+| `docs/多账号并发重构方案（豆包+抖音）.md` | 账号池、slot、并发设计 |

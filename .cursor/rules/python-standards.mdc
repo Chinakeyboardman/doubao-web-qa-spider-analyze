@@ -1,0 +1,46 @@
+---
+description: Python 代码规范
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Python 开发规范
+
+## 配置读取
+
+```python
+from pathlib import Path
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+```
+
+- 所有子项目统一从根目录 `.env` 加载配置
+- 使用 `pathlib.Path` 处理路径，不硬编码绝对路径
+
+## 数据库连接
+
+```python
+import os, psycopg2
+
+def get_connection():
+    return psycopg2.connect(
+        host=os.getenv("PGHOST", "localhost"),
+        port=int(os.getenv("PGPORT", "5432")),
+        dbname=os.getenv("PGDATABASE", "doubao"),
+        user=os.getenv("PGUSER", "root"),
+        password=os.getenv("PGPASSWORD", "123456"),
+    )
+```
+
+## 依赖管理
+
+- 每个子项目目录下放 `requirements.txt`
+- 安装用 `pip install -r requirements.txt`
+
+## 代码风格
+
+- 脚本入口用 `if __name__ == "__main__":`
+- 支持 `--dry-run` 参数方便调试
+- 幂等设计：重复运行不会产生重复数据（用 `ON CONFLICT DO NOTHING`）

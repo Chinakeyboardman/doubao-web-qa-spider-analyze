@@ -1,0 +1,41 @@
+---
+description: 本项目的核心架构约定和开发规范，所有对话都应遵守
+alwaysApply: true
+---
+
+# 项目架构约定
+
+## 开源项目保护原则（最高优先级）
+
+- **绝对不修改** `douyin-crawler/` 和 `Douyin_TikTok_Download_API/` 的任何文件
+- 业务逻辑写在 `integration/`、`query-input/`、`web-crawler/`、`data-clean/` 等独立目录
+- 调用开源项目通过 HTTP API、读取其 DB 输出、或在外部 import 其模块
+
+## 部署方式
+
+- **常规 Linux / macOS 部署**，不用 Docker
+- PG、Redis 用系统服务（brew services / systemctl）
+- 各子项目用本地进程运行
+
+## 数据库
+
+- 统一使用 PostgreSQL，库名 `doubao`，连接信息在根目录 `.env`
+- `douyin-crawler` 原有表（douyin_videos 等）保持原样，不改
+- 新业务表统一加 `qa_` 前缀（qa_query、qa_answer、qa_link、qa_link_content）
+- 建表脚本在 `init-db/init.sql`
+
+## 配置管理
+
+- 所有配置集中在根目录 `.env`，各子项目通过 `python-dotenv` 读取
+- `.env` 已 gitignore，提交用 `.env.example`
+
+## 技术栈偏好
+
+- Python 为主要开发语言
+- AI/Agent 优先使用 Langchain 框架
+- 模型调用优先使用火山云 API（Volcengine）
+
+## 进度管理
+
+- 每完成一步在 `docs/CHECKLIST.md` 中打 `[x]`，记录关键细节
+- 方便断点续做，新对话可直接从 CHECKLIST 恢复上下文
