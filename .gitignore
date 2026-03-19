@@ -82,6 +82,8 @@ Douyin_TikTok_Download_API/venv/
 Douyin_TikTok_Download_API/.venv/
 Douyin_TikTok_Download_API/.venv313/
 Douyin_TikTok_Download_API/.venv39/
+# 本地 config 备份（含 Cookie，勿提交）
+Douyin_TikTok_Download_API/**/config.yaml*.backup
 Douyin_TikTok_Download_API/download/
 Douyin_TikTok_Download_API/app/api/endpoints/download/
 Douyin_TikTok_Download_API/Screenshots/
