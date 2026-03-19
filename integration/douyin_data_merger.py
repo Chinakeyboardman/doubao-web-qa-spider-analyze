@@ -19,6 +19,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared.db import execute, fetch_all, fetch_one
+from shared.sql_builder import sb
 from shared.utils import extract_video_id_from_url, resolve_video_id
 
 logger = logging.getLogger(__name__)
@@ -40,16 +41,17 @@ class DouyinDataMerger:
         """
         not_enriched_filter = "" if force else " AND (lc.link_id IS NULL OR lc.raw_json IS NULL)"
         if link_ids:
+            any_frag, any_params = sb.expand_any("l.link_id", link_ids)
             rows = fetch_all(
-                "SELECT l.link_id, l.link_url, lc.raw_json, lc.content_json "
+                "SELECT l.link_id, l.link_url, l.updated_at AS link_updated_at, lc.raw_json, lc.content_json "
                 "FROM qa_link l "
                 "LEFT JOIN qa_link_content lc ON l.link_id = lc.link_id "
-                f"WHERE l.platform = '抖音' AND l.link_id = ANY(%s){not_enriched_filter}",
-                (link_ids,),
+                f"WHERE l.platform = '抖音' AND {any_frag}{not_enriched_filter}",
+                any_params,
             )
         else:
             rows = fetch_all(
-                "SELECT l.link_id, l.link_url, lc.raw_json, lc.content_json "
+                "SELECT l.link_id, l.link_url, l.updated_at AS link_updated_at, lc.raw_json, lc.content_json "
                 "FROM qa_link l "
                 "LEFT JOIN qa_link_content lc ON l.link_id = lc.link_id "
                 f"WHERE l.platform = '抖音'{not_enriched_filter}"
@@ -108,11 +110,13 @@ class DouyinDataMerger:
             merged_json = json.dumps(merged, ensure_ascii=False)
 
             if row.get("raw_json") is None and row.get("content_json") is None:
+                _upsert = sb.upsert_suffix(
+                    ["link_id"], ["raw_json"],
+                )
                 execute(
                     "INSERT INTO qa_link_content (link_id, raw_json, video_parse_status, status) "
                     "VALUES (%s, %s, 'pending', 'done') "
-                    "ON CONFLICT (link_id) DO UPDATE SET "
-                    "raw_json = EXCLUDED.raw_json, video_parse_status = 'pending'",
+                    + _upsert + ", video_parse_status = 'pending'",
                     (link_id, merged_json),
                 )
             else:
@@ -123,11 +127,16 @@ class DouyinDataMerger:
 
             _sync_link_video_metadata(link_id, merged, video_id)
 
-            execute(
+            link_updated_at = row.get("link_updated_at")
+            ol = " AND updated_at = %s" if link_updated_at else ""
+            params = (link_id, link_updated_at) if link_updated_at else (link_id,)
+            n = execute(
                 "UPDATE qa_link SET status = 'done', fetched_at = CURRENT_TIMESTAMP "
-                "WHERE link_id = %s AND status != 'done'",
-                (link_id,),
+                "WHERE link_id = %s AND status != 'done'" + ol,
+                params,
             )
+            if link_updated_at and n == 0:
+                logger.warning("DouyinDataMerger: link %s optimistic lock failed", link_id)
             publish_time = _extract_publish_time(video_row, merged)
             popularity = _build_popularity(video_row, merged)
             if publish_time or popularity:
@@ -378,32 +387,46 @@ def _sync_link_video_metadata(link_id: str, merged: dict, video_id: str) -> None
     initial_status = "skip" if has_subtitles else "pending"
     subtitles_json = json.dumps(subtitles, ensure_ascii=False) if subtitles else None
 
-    execute(
-        "INSERT INTO qa_link_video "
-        "(link_id, model_api_input_type, video_id, play_url, cover_url, duration, "
-        " subtitles, raw_api_response, status, fetched_at) "
-        "VALUES (%s, 'input_audio', %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP) "
-        "ON CONFLICT (link_id, model_api_input_type) DO UPDATE SET "
-        "video_id  = COALESCE(NULLIF(EXCLUDED.video_id, ''), qa_link_video.video_id), "
-        "play_url  = COALESCE(NULLIF(EXCLUDED.play_url, ''), qa_link_video.play_url), "
-        "cover_url = COALESCE(NULLIF(EXCLUDED.cover_url, ''), qa_link_video.cover_url), "
-        "duration  = GREATEST(EXCLUDED.duration, qa_link_video.duration), "
-        "subtitles = COALESCE(EXCLUDED.subtitles, qa_link_video.subtitles), "
-        "raw_api_response = COALESCE(qa_link_video.raw_api_response, EXCLUDED.raw_api_response), "
-        "fetched_at = COALESCE(qa_link_video.fetched_at, EXCLUDED.fetched_at), "
-        "status    = CASE WHEN qa_link_video.status IN ('done','skip') "
-        "           THEN qa_link_video.status ELSE EXCLUDED.status END",
-        (
-            link_id,
-            video_id,
-            vi.get("play_url") or "",
-            vi.get("cover_url") or "",
-            int(vi.get("duration") or 0),
-            subtitles_json,
-            json.dumps(merged, ensure_ascii=False),
-            initial_status,
-        ),
-    )
+    if sb.is_pg:
+        execute(
+            "INSERT INTO qa_link_video "
+            "(link_id, model_api_input_type, video_id, play_url, cover_url, duration, "
+            " subtitles, raw_api_response, status, fetched_at) "
+            "VALUES (%s, 'input_audio', %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP) "
+            "ON CONFLICT (link_id, model_api_input_type) DO UPDATE SET "
+            "video_id  = COALESCE(NULLIF(EXCLUDED.video_id, ''), qa_link_video.video_id), "
+            "play_url  = COALESCE(NULLIF(EXCLUDED.play_url, ''), qa_link_video.play_url), "
+            "cover_url = COALESCE(NULLIF(EXCLUDED.cover_url, ''), qa_link_video.cover_url), "
+            "duration  = GREATEST(EXCLUDED.duration, qa_link_video.duration), "
+            "subtitles = COALESCE(EXCLUDED.subtitles, qa_link_video.subtitles), "
+            "raw_api_response = COALESCE(qa_link_video.raw_api_response, EXCLUDED.raw_api_response), "
+            "fetched_at = COALESCE(qa_link_video.fetched_at, EXCLUDED.fetched_at), "
+            "status    = CASE WHEN qa_link_video.status IN ('done','skip') "
+            "           THEN qa_link_video.status ELSE EXCLUDED.status END",
+            (link_id, video_id, vi.get("play_url") or "", vi.get("cover_url") or "",
+             int(vi.get("duration") or 0), subtitles_json,
+             json.dumps(merged, ensure_ascii=False), initial_status),
+        )
+    else:
+        execute(
+            "INSERT INTO qa_link_video "
+            "(link_id, model_api_input_type, video_id, play_url, cover_url, duration, "
+            " subtitles, raw_api_response, status, fetched_at) "
+            "VALUES (%s, 'input_audio', %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP) "
+            "ON DUPLICATE KEY UPDATE "
+            "video_id  = COALESCE(NULLIF(VALUES(video_id), ''), video_id), "
+            "play_url  = COALESCE(NULLIF(VALUES(play_url), ''), play_url), "
+            "cover_url = COALESCE(NULLIF(VALUES(cover_url), ''), cover_url), "
+            "duration  = GREATEST(VALUES(duration), duration), "
+            "subtitles = COALESCE(VALUES(subtitles), subtitles), "
+            "raw_api_response = COALESCE(raw_api_response, VALUES(raw_api_response)), "
+            "fetched_at = COALESCE(fetched_at, VALUES(fetched_at)), "
+            "status    = CASE WHEN status IN ('done','skip') "
+            "           THEN status ELSE VALUES(status) END",
+            (link_id, video_id, vi.get("play_url") or "", vi.get("cover_url") or "",
+             int(vi.get("duration") or 0), subtitles_json,
+             json.dumps(merged, ensure_ascii=False), initial_status),
+        )
 
 
 if __name__ == "__main__":

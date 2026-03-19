@@ -177,10 +177,10 @@ class TestBatchProcessV2(unittest.TestCase):
     """Tests for batch_process using qa_link_video (claim_pending_video_parse_v2)."""
 
     @patch.object(transcriber, "execute")
-    @patch.object(transcriber, "fetch_all")
+    @patch("shared.claim_functions.claim_pending_video_parse_v2")
     @patch.object(transcriber, "process_one")
-    def test_batch_process_success(self, mock_process_one, mock_fetch_all, mock_execute):
-        mock_fetch_all.return_value = [
+    def test_batch_process_success(self, mock_process_one, mock_claim, mock_execute):
+        mock_claim.return_value = [
             {
                 "vid": 1,
                 "query_id": "Q0001",
@@ -202,17 +202,17 @@ class TestBatchProcessV2(unittest.TestCase):
 
         count = batch_process(query_ids=["Q0001"], concurrency=1)
         self.assertEqual(count, 1)
-        self.assertIn("claim_pending_video_parse_v2", mock_fetch_all.call_args[0][0])
+        self.assertTrue(mock_claim.called)
 
         sql_calls = [c.args[0] for c in mock_execute.call_args_list]
         self.assertTrue(any("UPDATE qa_link_content" in s for s in sql_calls))
         self.assertTrue(any("UPDATE qa_link_video" in s for s in sql_calls))
 
     @patch.object(transcriber, "execute")
-    @patch.object(transcriber, "fetch_all")
+    @patch("shared.claim_functions.claim_pending_video_parse_v2")
     @patch.object(transcriber, "process_one")
-    def test_batch_process_skip_subtitles(self, mock_process_one, mock_fetch_all, mock_execute):
-        mock_fetch_all.return_value = [
+    def test_batch_process_skip_subtitles(self, mock_process_one, mock_claim, mock_execute):
+        mock_claim.return_value = [
             {
                 "vid": 2,
                 "query_id": "Q0001",
@@ -230,11 +230,11 @@ class TestBatchProcessV2(unittest.TestCase):
         self.assertTrue(any("qa_link_video" in s for s in sql_calls))
 
     @patch.object(transcriber, "execute")
-    @patch.object(transcriber, "fetch_all")
+    @patch("shared.claim_functions.claim_pending_video_parse_v2")
     @patch.object(transcriber, "process_one")
-    def test_old_orders_missing_douyin_data_mark_error(self, mock_process_one, mock_fetch_all, mock_execute):
+    def test_old_orders_missing_douyin_data_mark_error(self, mock_process_one, mock_claim, mock_execute):
         """Old-order cases where Douyin media is unavailable should become error, not block flow."""
-        mock_fetch_all.return_value = [
+        mock_claim.return_value = [
             {
                 "vid": 10,
                 "query_id": "Q0002",

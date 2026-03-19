@@ -18,6 +18,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared.db import execute, fetch_all
+from shared.sql_builder import sb
 
 
 def fix_csdn_platform(apply: bool) -> int:
@@ -34,16 +35,16 @@ def fix_csdn_platform(apply: bool) -> int:
         return len(rows)
 
     ids = [r["link_id"] for r in rows]
+    any_frag, any_params = sb.expand_any("link_id", ids)
     cnt = execute(
-        "UPDATE qa_link SET platform = 'CSDN' WHERE link_id = ANY(%s)",
-        (ids,),
+        f"UPDATE qa_link SET platform = 'CSDN' WHERE {any_frag}",
+        any_params,
     )
     print(f"  => 已更新 {cnt} 条 platform -> 'CSDN'")
 
-    # 清除 content_json 让 structure 重新生成（raw_json 保留）
     cnt2 = execute(
-        "UPDATE qa_link_content SET content_json = NULL WHERE link_id = ANY(%s)",
-        (ids,),
+        f"UPDATE qa_link_content SET content_json = NULL WHERE {any_frag}",
+        any_params,
     )
     print(f"  => 已清除 {cnt2} 条 content_json (raw_json 保留，等待 re-structure)")
     return len(rows)
@@ -51,15 +52,17 @@ def fix_csdn_platform(apply: bool) -> int:
 
 def fix_empty_toutiao_smzdm(apply: bool) -> int:
     """Step 2: 精确重置头条和什么值得买中空内容的 done 记录为 pending。"""
+    _raw_text = sb.json_extract_text("lc.raw_json", "raw_text")
+    _paragraphs = sb.json_extract("lc.raw_json", "paragraphs")
+    _arr_len = sb.json_array_length(f"COALESCE({_paragraphs}, {sb.json_cast('[]')})")
     rows = fetch_all(
         "SELECT l.link_id, l.platform, l.link_url "
         "FROM qa_link l "
         "JOIN qa_link_content lc ON l.link_id = lc.link_id "
         "WHERE l.status = 'done' "
         "AND l.platform IN ('头条', '什么值得买') "
-        "AND (lc.raw_json->>'raw_text' IS NULL OR lc.raw_json->>'raw_text' = '') "
-        "AND (lc.raw_json->'paragraphs' IS NULL "
-        "     OR jsonb_array_length(COALESCE(lc.raw_json->'paragraphs', '[]'::jsonb)) = 0)"
+        f"AND ({_raw_text} IS NULL OR {_raw_text} = '') "
+        f"AND ({_paragraphs} IS NULL OR {_arr_len} = 0)"
     )
     by_plat: dict[str, list] = {}
     for r in rows:
@@ -78,16 +81,17 @@ def fix_empty_toutiao_smzdm(apply: bool) -> int:
         return total
 
     ids = [r["link_id"] for r in rows]
+    any_frag, any_params = sb.expand_any("link_id", ids)
     cnt1 = execute(
-        "UPDATE qa_link SET status = 'pending' WHERE link_id = ANY(%s)",
-        (ids,),
+        f"UPDATE qa_link SET status = 'pending' WHERE {any_frag}",
+        any_params,
     )
     print(f"  => 已重置 {cnt1} 条 qa_link.status -> 'pending'")
 
     cnt2 = execute(
         "UPDATE qa_link_content SET raw_json = NULL, content_json = NULL, status = 'pending' "
-        "WHERE link_id = ANY(%s)",
-        (ids,),
+        f"WHERE {any_frag}",
+        any_params,
     )
     print(f"  => 已清除 {cnt2} 条 raw_json + content_json + status -> 'pending' (等待重爬)")
     return total

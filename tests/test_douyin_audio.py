@@ -302,10 +302,10 @@ class DouyinAudioUnitTests(unittest.TestCase):
                 self.assertEqual(result["transcript_model"], "raw_text_fallback")
 
     @patch("integration.douyin_audio_transcriber.execute")
-    @patch("integration.douyin_audio_transcriber.fetch_all")
+    @patch("shared.claim_functions.claim_pending_video_parse_v2")
     @patch("integration.douyin_audio_transcriber.process_one")
-    def test_batch_process_updates_raw_json(self, mock_process_one, mock_fetch_all, mock_execute):
-        mock_fetch_all.return_value = [
+    def test_batch_process_updates_raw_json(self, mock_process_one, mock_claim, mock_execute):
+        mock_claim.return_value = [
             {
                 "vid": 1,
                 "query_id": "Q0001",
@@ -325,8 +325,7 @@ class DouyinAudioUnitTests(unittest.TestCase):
         count = batch_process(query_ids=["Q0001"], concurrency=1)
         self.assertEqual(count, 1)
         self.assertTrue(mock_execute.called)
-        self.assertTrue(mock_fetch_all.called)
-        self.assertIn("claim_pending_video_parse", mock_fetch_all.call_args[0][0])
+        self.assertTrue(mock_claim.called)
         sql_calls = [c.args[0] for c in mock_execute.call_args_list]
         self.assertTrue(any("UPDATE qa_link_content" in sql for sql in sql_calls))
         self.assertTrue(any("video_parse_status" in sql for sql in sql_calls))

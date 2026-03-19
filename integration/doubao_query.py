@@ -14,7 +14,8 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from openai import OpenAI
 
 from shared.config import CONFIG
-from shared.db import execute, fetch_all, fetch_one, get_cursor
+from shared.db import execute, execute_returning, fetch_all, fetch_one, get_cursor
+from shared.sql_builder import sb
 from integration.citation_parser import parse_citations
 
 logger = logging.getLogger(__name__)
@@ -49,14 +50,18 @@ class DoubaoQueryCollector:
         """
         logger.info("Collecting answer for %s: %s", query_id, query_text[:60])
 
-        claimed = execute(
+        row = execute_returning(
             "UPDATE qa_query SET status = 'processing' "
-            "WHERE query_id = %s AND status = 'pending'",
+            "WHERE query_id = %s AND status = 'pending' "
+            + sb.returning_clause(["updated_at"]),
             (query_id,),
+            returning_select="SELECT updated_at FROM qa_query WHERE query_id = %s AND status = 'processing'",
+            returning_params=(query_id,),
         )
-        if claimed == 0:
+        if not row:
             logger.info("Query %s already claimed or done, skipping", query_id)
             return {"answer_text": "", "citations_count": 0, "link_ids": [], "skipped": True}
+        query_updated_at = row["updated_at"]
         existing_answer = fetch_one(
             "SELECT id FROM qa_answer WHERE query_id = %s",
             (query_id,),
@@ -76,11 +81,15 @@ class DoubaoQueryCollector:
             response = self._call_api(query_text)
         except Exception as exc:
             logger.error("API call failed for %s: %s", query_id, exc)
-            execute(
+            ol = " AND updated_at = %s" if query_updated_at else ""
+            params = (str(exc)[:500], query_id, query_updated_at) if query_updated_at else (str(exc)[:500], query_id)
+            n = execute(
                 "UPDATE qa_query SET status = 'error', error_message = %s, "
-                "retry_count = COALESCE(retry_count, 0) + 1 WHERE query_id = %s",
-                (str(exc)[:500], query_id),
+                "retry_count = COALESCE(retry_count, 0) + 1 WHERE query_id = %s" + ol,
+                params,
             )
+            if query_updated_at and n == 0:
+                logger.warning("Query %s optimistic lock failed (error)", query_id)
             execute(
                 "UPDATE qa_answer SET status = 'error' WHERE query_id = %s",
                 (query_id,),
@@ -97,10 +106,14 @@ class DoubaoQueryCollector:
         link_ids = self._save_links(query_id, citations)
 
         # Mark query done
-        execute(
-            "UPDATE qa_query SET status = 'done' WHERE query_id = %s",
-            (query_id,),
+        ol = " AND updated_at = %s" if query_updated_at else ""
+        params = (query_id, query_updated_at) if query_updated_at else (query_id,)
+        n = execute(
+            "UPDATE qa_query SET status = 'done' WHERE query_id = %s" + ol,
+            params,
         )
+        if query_updated_at and n == 0:
+            logger.warning("Query %s optimistic lock failed (done)", query_id)
 
         logger.info(
             "Done %s — answer %d chars, %d citations",
@@ -120,10 +133,8 @@ class DoubaoQueryCollector:
     # ------------------------------------------------------------------
     def batch_collect(self, batch_size: int = 10) -> list[str]:
         """Process a batch of pending queries. Returns list of processed query_ids."""
-        rows = fetch_all(
-            "SELECT * FROM claim_pending_queries(%s)",
-            (batch_size,),
-        )
+        from shared.claim_functions import claim_pending_queries
+        rows = claim_pending_queries(batch_size)
         if not rows:
             logger.info("No pending queries to process.")
             return []
@@ -251,16 +262,17 @@ class DoubaoQueryCollector:
                 "SELECT link_url, platform, content_format FROM qa_link WHERE link_id = %s",
                 (link_id,),
             )
+            _upsert_suffix = sb.upsert_suffix(
+                ["link_id"],
+                ["query_id", "link_url", "platform", "content_format"],
+            )
             execute(
                 "INSERT INTO qa_link "
                 "(query_id, link_id, link_url, platform, content_format, status) "
                 "VALUES (%s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (link_id) DO UPDATE SET "
-                "query_id=EXCLUDED.query_id, link_url=EXCLUDED.link_url, "
-                "platform=EXCLUDED.platform, content_format=EXCLUDED.content_format, "
-                "publish_time=NULL, popularity=NULL, fetched_at=NULL, "
-                "status='pending', "
-                "updated_at=CURRENT_TIMESTAMP",
+                + _upsert_suffix
+                + ", publish_time=NULL, popularity=NULL, fetched_at=NULL, "
+                "status='pending', updated_at=CURRENT_TIMESTAMP",
                 (
                     query_id,
                     link_id,
@@ -279,9 +291,10 @@ class DoubaoQueryCollector:
             link_ids.append(link_id)
 
         # Clean stale links for this query when citation count shrinks.
+        not_frag, not_params = sb.expand_not_all("link_id", link_ids or [""])
         stale_rows = fetch_all(
-            "SELECT link_id FROM qa_link WHERE query_id = %s AND link_id <> ALL(%s)",
-            (query_id, link_ids or [""]),
+            f"SELECT link_id FROM qa_link WHERE query_id = %s AND {not_frag}",
+            (query_id, *not_params),
         )
         for row in stale_rows:
             stale_id = row["link_id"]

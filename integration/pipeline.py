@@ -21,6 +21,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "web-crawler"))
 sys.path.insert(0, str(_PROJECT_ROOT / "data-clean"))
 
 from shared.db import execute, fetch_all, fetch_one
+from shared.sql_builder import sb
 from integration.parsing_routing import use_douyin_download_llm, use_agent_web_summary
 from integration.douyin_data_merger import (
     DouyinDataMerger,
@@ -425,14 +426,20 @@ class QAPipeline:
         text = str(exc or "").lower()
         return "target page, context or browser has been closed" in text
 
-    async def _collect_one_with_risk_recovery(self, query_id: str, query_text: str) -> None:
+    async def _collect_one_with_risk_recovery(
+        self, query_id: str, query_text: str, *,
+        _skip_claim: bool = False, _query_updated_at=None,
+    ) -> None:
         """Collect one query with ordered recovery:
         1. TargetClosedError -> rebuild browser + retry
         2. captcha/suspected -> headed solve/manual -> retry
         3. switch account -> retry
         """
         try:
-            result = await self.collector.collect_one(query_id, query_text)
+            result = await self.collector.collect_one(
+                query_id, query_text,
+                _skip_claim=_skip_claim, _query_updated_at=_query_updated_at,
+            )
             if result and result.get("skipped"):
                 logger.info("Collect %s: skipped (already claimed by another worker)", query_id)
             return
@@ -444,7 +451,9 @@ class QAPipeline:
                 )
                 await self._rebuild_browser()
                 try:
-                    await self.collector.collect_one(query_id, query_text, _skip_claim=True)
+                    await self.collector.collect_one(
+                        query_id, query_text, _skip_claim=True,
+                    )
                     return
                 except Exception as rebuild_exc:
                     logger.warning(
@@ -471,7 +480,9 @@ class QAPipeline:
             await self._manual_verify_then_resume()
             logger.info("Retrying %s after headed captcha/manual handling...", query_id)
             try:
-                await self.collector.collect_one(query_id, query_text, _skip_claim=True)
+                await self.collector.collect_one(
+                    query_id, query_text, _skip_claim=True,
+                )
                 return
             except Exception as headed_exc:
                 logger.warning(
@@ -482,7 +493,9 @@ class QAPipeline:
 
         await self._switch_account_then_resume()
         logger.info("Retrying %s after account switch...", query_id)
-        await self.collector.collect_one(query_id, query_text, _skip_claim=True)
+        await self.collector.collect_one(
+            query_id, query_text, _skip_claim=True,
+        )
 
     # ------------------------------------------------------------------
     # Full pipeline
@@ -646,10 +659,8 @@ class QAPipeline:
         try:
             if query_ids:
                 return await self._collect_query_list(query_ids)
-            rows = fetch_all(
-                "SELECT * FROM claim_pending_queries(%s)",
-                (batch_size,),
-            )
+            from shared.claim_functions import claim_pending_queries
+            rows = claim_pending_queries(batch_size)
             if not rows:
                 logger.info("No pending queries")
                 return []
@@ -658,7 +669,8 @@ class QAPipeline:
                 try:
                     await self._ensure_browser_ready()
                     await self._collect_one_with_risk_recovery(
-                        row["query_id"], row["query_text"]
+                        row["query_id"], row["query_text"],
+                        _skip_claim=True, _query_updated_at=row.get("updated_at"),
                     )
                     processed.append(row["query_id"])
                     self._consecutive_risk_failures = 0
@@ -738,12 +750,13 @@ class QAPipeline:
         or have no qa_link_content row at all.
         """
         if query_ids:
+            any_frag, any_params = sb.expand_any("l.query_id", query_ids)
             rows = fetch_all(
                 "SELECT l.link_id FROM qa_link l "
                 "LEFT JOIN qa_link_content lc ON l.link_id = lc.link_id "
-                "WHERE l.platform = '抖音' AND l.query_id = ANY(%s) "
+                f"WHERE l.platform = '抖音' AND {any_frag} "
                 "AND (lc.link_id IS NULL OR lc.raw_json IS NULL)",
-                (query_ids,),
+                any_params,
             )
         else:
             rows = fetch_all(
@@ -790,22 +803,24 @@ class QAPipeline:
         # - raw material exists (raw_json IS NOT NULL)
         # - LLM structuring hasn't been done yet (content_json IS NULL)
         if link_ids:
+            any_frag, any_params = sb.expand_any("lc.link_id", link_ids)
             rows = fetch_all(
                 "SELECT lc.link_id, lc.raw_json, lc.content_json, l.content_format, l.platform "
                 "FROM qa_link_content lc "
                 "JOIN qa_link l ON l.link_id = lc.link_id "
-                "WHERE l.status = 'done' AND lc.link_id = ANY(%s) "
+                f"WHERE l.status = 'done' AND {any_frag} "
                 "AND lc.raw_json IS NOT NULL AND lc.content_json IS NULL",
-                (link_ids,),
+                any_params,
             )
         elif query_ids:
+            any_frag, any_params = sb.expand_any("l.query_id", query_ids)
             rows = fetch_all(
                 "SELECT lc.link_id, lc.raw_json, lc.content_json, l.content_format, l.platform "
                 "FROM qa_link_content lc "
                 "JOIN qa_link l ON l.link_id = lc.link_id "
-                "WHERE l.status = 'done' AND l.query_id = ANY(%s) "
+                f"WHERE l.status = 'done' AND {any_frag} "
                 "AND lc.raw_json IS NOT NULL AND lc.content_json IS NULL",
-                (query_ids,),
+                any_params,
             )
         else:
             rows = fetch_all(
@@ -927,12 +942,13 @@ class QAPipeline:
         from structurer import structured_to_raw
 
         if link_ids:
+            any_frag, any_params = sb.expand_any("lc.link_id", link_ids)
             rows = fetch_all(
                 "SELECT lc.link_id, lc.raw_json, lc.content_json, l.content_format, l.platform "
                 "FROM qa_link_content lc "
                 "JOIN qa_link l ON l.link_id = lc.link_id "
-                "WHERE lc.link_id = ANY(%s)",
-                (link_ids,),
+                f"WHERE {any_frag}",
+                any_params,
             )
         elif include_all:
             rows = fetch_all(
@@ -946,7 +962,7 @@ class QAPipeline:
                 "FROM qa_link_content lc "
                 "JOIN qa_link l ON l.link_id = lc.link_id "
                 "WHERE l.status = 'done' "
-                "AND l.updated_at >= CURRENT_TIMESTAMP - INTERVAL '2 hours'"
+                f"AND l.updated_at >= {sb.interval_ago(2)}"
             )
         count = 0
         skipped = 0
@@ -1042,28 +1058,37 @@ class QAPipeline:
         - processing 超过 2 小时：视为卡死，重置为 pending
         """
         # 卡死的 processing（超过 2 小时）重置为 pending
+        _2h_ago = sb.interval_ago(2)
         q_stuck = execute(
-            "UPDATE qa_query SET status = 'pending' "
-            "WHERE status = 'processing' AND updated_at < CURRENT_TIMESTAMP - INTERVAL '2 hours'"
+            f"UPDATE qa_query SET status = 'pending' "
+            f"WHERE status = 'processing' AND updated_at < {_2h_ago}"
         )
         l_stuck = execute(
-            "UPDATE qa_link SET status = 'pending' "
-            "WHERE status = 'processing' AND updated_at < CURRENT_TIMESTAMP - INTERVAL '2 hours'"
+            f"UPDATE qa_link SET status = 'pending' "
+            f"WHERE status = 'processing' AND updated_at < {_2h_ago}"
         )
         v_stuck = execute(
-            "UPDATE qa_link_video "
-            "SET status = 'pending' "
-            "WHERE status = 'processing' "
-            "AND updated_at < CURRENT_TIMESTAMP - INTERVAL '2 hours'"
+            f"UPDATE qa_link_video "
+            f"SET status = 'pending' "
+            f"WHERE status = 'processing' "
+            f"AND updated_at < {_2h_ago}"
         )
-        # Mirror to qa_link_content for backward compat
-        execute(
-            "UPDATE qa_link_content lc "
-            "SET video_parse_status = 'pending' "
-            "FROM qa_link_video v "
-            "WHERE v.link_id = lc.link_id AND v.status = 'pending' "
-            "AND lc.video_parse_status = 'processing'"
-        )
+        if sb.is_pg:
+            execute(
+                "UPDATE qa_link_content lc "
+                "SET video_parse_status = 'pending' "
+                "FROM qa_link_video v "
+                "WHERE v.link_id = lc.link_id AND v.status = 'pending' "
+                "AND lc.video_parse_status = 'processing'"
+            )
+        else:
+            execute(
+                "UPDATE qa_link_content lc "
+                "JOIN qa_link_video v ON v.link_id = lc.link_id "
+                "SET lc.video_parse_status = 'pending' "
+                "WHERE v.status = 'pending' "
+                "AND lc.video_parse_status = 'processing'"
+            )
         if q_stuck or l_stuck or v_stuck:
             logger.info(
                 "Reset stuck processing (>2h): queries=%d links=%d douyin_video_parse=%d",
@@ -1077,19 +1102,20 @@ class QAPipeline:
         err_qids_rows = fetch_all("SELECT query_id FROM qa_query WHERE status = 'error'")
         err_qids = [r["query_id"] for r in err_qids_rows]
         if err_qids:
+            any_frag, any_params = sb.expand_any("query_id", err_qids)
             execute(
                 "DELETE FROM qa_link_content WHERE link_id IN "
-                "(SELECT link_id FROM qa_link WHERE query_id = ANY(%s) AND status = 'error')",
-                (err_qids,),
+                f"(SELECT link_id FROM qa_link WHERE {any_frag} AND status = 'error')",
+                any_params,
             )
             execute(
-                "DELETE FROM qa_link WHERE query_id = ANY(%s) AND status = 'error'",
-                (err_qids,),
+                f"DELETE FROM qa_link WHERE {any_frag} AND status = 'error'",
+                any_params,
             )
             execute(
-                "DELETE FROM qa_answer WHERE query_id = ANY(%s) AND "
+                f"DELETE FROM qa_answer WHERE {any_frag} AND "
                 "(answer_text IS NULL OR answer_text = '')",
-                (err_qids,),
+                any_params,
             )
 
         q_count = execute(
@@ -1100,13 +1126,22 @@ class QAPipeline:
         if all_errors:
             l_count = execute("UPDATE qa_link SET status = 'pending' WHERE status = 'error'")
             execute("UPDATE qa_link_video SET status = 'pending' WHERE status = 'error'")
-            execute(
-                "UPDATE qa_link_content lc "
-                "SET video_parse_status = 'pending' "
-                "FROM qa_link_video v "
-                "WHERE v.link_id = lc.link_id AND v.status = 'pending' "
-                "AND lc.video_parse_status = 'error'"
-            )
+            if sb.is_pg:
+                execute(
+                    "UPDATE qa_link_content lc "
+                    "SET video_parse_status = 'pending' "
+                    "FROM qa_link_video v "
+                    "WHERE v.link_id = lc.link_id AND v.status = 'pending' "
+                    "AND lc.video_parse_status = 'error'"
+                )
+            else:
+                execute(
+                    "UPDATE qa_link_content lc "
+                    "JOIN qa_link_video v ON v.link_id = lc.link_id "
+                    "SET lc.video_parse_status = 'pending' "
+                    "WHERE v.status = 'pending' "
+                    "AND lc.video_parse_status = 'error'"
+                )
             logger.info("Reset %d queries and %d links from error to pending (all_errors)", q_count, l_count)
             return {
                 "queries_stuck_reset": q_stuck,
@@ -1142,22 +1177,33 @@ class QAPipeline:
 
         l_count = 0
         if retryable_ids:
+            any_frag, any_params = sb.expand_any("link_id", retryable_ids)
             l_count = execute(
-                "UPDATE qa_link SET status = 'pending' WHERE link_id = ANY(%s)",
-                (retryable_ids,),
+                f"UPDATE qa_link SET status = 'pending' WHERE {any_frag}",
+                any_params,
             )
             execute(
-                "UPDATE qa_link_video SET status = 'pending' "
-                "WHERE link_id = ANY(%s) AND status = 'error'",
-                (retryable_ids,),
+                f"UPDATE qa_link_video SET status = 'pending' "
+                f"WHERE {any_frag} AND status = 'error'",
+                any_params,
             )
-            execute(
-                "UPDATE qa_link_content lc SET video_parse_status = 'pending' "
-                "FROM qa_link_video v "
-                "WHERE v.link_id = lc.link_id "
-                "AND lc.link_id = ANY(%s) AND v.status = 'pending'",
-                (retryable_ids,),
-            )
+            if sb.is_pg:
+                any_frag2, any_params2 = sb.expand_any("lc.link_id", retryable_ids)
+                execute(
+                    "UPDATE qa_link_content lc SET video_parse_status = 'pending' "
+                    "FROM qa_link_video v "
+                    f"WHERE v.link_id = lc.link_id AND {any_frag2} AND v.status = 'pending'",
+                    any_params2,
+                )
+            else:
+                any_frag2, any_params2 = sb.expand_any("lc.link_id", retryable_ids)
+                execute(
+                    "UPDATE qa_link_content lc "
+                    "JOIN qa_link_video v ON v.link_id = lc.link_id "
+                    f"SET lc.video_parse_status = 'pending' "
+                    f"WHERE {any_frag2} AND v.status = 'pending'",
+                    any_params2,
+                )
         logger.info(
             "Reset %d queries and %d retryable links to pending; skipped_non_retryable=%d",
             q_count,

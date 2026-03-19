@@ -446,24 +446,38 @@ def process_one(
     }
 
 
-def _set_video_status(vid: int, link_id: str, status: str, error_message: str = "") -> None:
+def _set_video_status(
+    vid: int, link_id: str, status: str, error_message: str = "",
+    video_updated_at=None, content_updated_at=None,
+) -> None:
     """Update status on qa_link_video (by PK) and qa_link_content.video_parse_status."""
     extra = ""
     params: list = [status, vid]
     if error_message:
         extra = ", error_message = %s, retry_count = retry_count + 1"
         params = [status, error_message, vid]
-    execute(
-        f"UPDATE qa_link_video SET status = %s{extra} WHERE id = %s",
-        tuple(params),
+    ol_v = " AND updated_at = %s" if video_updated_at else ""
+    params_v = tuple(params) + (video_updated_at,) if video_updated_at else tuple(params)
+    n = execute(
+        f"UPDATE qa_link_video SET status = %s{extra} WHERE id = %s{ol_v}",
+        params_v,
     )
-    execute(
-        "UPDATE qa_link_content SET video_parse_status = %s WHERE link_id = %s",
-        (status, link_id),
+    if video_updated_at and n == 0:
+        logger.warning("[audio] qa_link_video id=%s optimistic lock failed", vid)
+    ol_c = " AND updated_at = %s" if content_updated_at else ""
+    params_c = (status, link_id, content_updated_at) if content_updated_at else (status, link_id)
+    n = execute(
+        f"UPDATE qa_link_content SET video_parse_status = %s WHERE link_id = %s{ol_c}",
+        params_c,
     )
+    if content_updated_at and n == 0:
+        logger.warning("[audio] qa_link_content %s optimistic lock failed", link_id)
 
 
-def _sync_to_content(vid: int, link_id: str, result: dict, raw: dict) -> None:
+def _sync_to_content(
+    vid: int, link_id: str, result: dict, raw: dict,
+    video_updated_at=None, content_updated_at=None,
+) -> None:
     """Write STT results back into qa_link_content.raw_json (by link_id)
     and qa_link_video (by PK vid), then clear content_json for re-structuring.
     """
@@ -489,31 +503,35 @@ def _sync_to_content(vid: int, link_id: str, result: dict, raw: dict) -> None:
     elif not _has_meaningful_subtitles(raw):
         raw["subtitles"] = [{"start_time": "", "text": stt_text}]
 
-    execute(
+    ol_c = " AND updated_at = %s" if content_updated_at else ""
+    params_c = (json.dumps(raw, ensure_ascii=False), link_id, content_updated_at) if content_updated_at else (json.dumps(raw, ensure_ascii=False), link_id)
+    n = execute(
         "UPDATE qa_link_content "
         "SET raw_json = %s, content_json = NULL, status = 'done', video_parse_status = 'done' "
-        "WHERE link_id = %s",
-        (json.dumps(raw, ensure_ascii=False), link_id),
+        f"WHERE link_id = %s{ol_c}",
+        params_c,
     )
+    if content_updated_at and n == 0:
+        logger.warning("[audio] qa_link_content %s optimistic lock failed (sync)", link_id)
 
-    execute(
+    ol_v = " AND updated_at = %s" if video_updated_at else ""
+    base = (
+        stt_text, result.get("video_path", ""), result.get("audio_path", ""),
+        model_name, result.get("transcript_source", ""), result.get("model_api_file_id", ""),
+        json.dumps(raw.get("subtitles") or [], ensure_ascii=False), vid,
+    )
+    params_v = base + (video_updated_at,) if video_updated_at else base
+    n = execute(
         "UPDATE qa_link_video SET "
         "stt_text = %s, video_path = %s, audio_path = %s, "
         "transcript_model = %s, transcript_source = %s, "
         "model_api_file_id = %s, subtitles = %s, "
         "status = 'done', transcribed_at = CURRENT_TIMESTAMP "
-        "WHERE id = %s",
-        (
-            stt_text,
-            result.get("video_path", ""),
-            result.get("audio_path", ""),
-            model_name,
-            result.get("transcript_source", ""),
-            result.get("model_api_file_id", ""),
-            json.dumps(raw.get("subtitles") or [], ensure_ascii=False),
-            vid,
-        ),
+        f"WHERE id = %s{ol_v}",
+        params_v,
     )
+    if video_updated_at and n == 0:
+        logger.warning("[audio] qa_link_video id=%s optimistic lock failed (sync)", vid)
 
 
 def batch_process(
@@ -524,10 +542,8 @@ def batch_process(
     batch_size: int = 1000,
 ) -> int:
     """Claim one batch from qa_link_video, process, and sync results to qa_link_content."""
-    rows = fetch_all(
-        "SELECT * FROM claim_pending_video_parse_v2(%s, %s)",
-        (max(1, int(batch_size)), query_ids or None),
-    )
+    from shared.claim_functions import claim_pending_video_parse_v2
+    rows = claim_pending_video_parse_v2(max(1, int(batch_size)), query_ids=query_ids or None)
 
     if not rows:
         logger.info("[audio] no eligible douyin links for transcription")
@@ -535,7 +551,7 @@ def batch_process(
 
     success_count = 0
 
-    def _run(row: dict) -> tuple[int, str, dict, dict]:
+    def _run(row: dict) -> tuple[int, str, dict, dict, dict]:
         vid = row["vid"]
         link_id = row["link_id"]
         try:
@@ -552,39 +568,40 @@ def batch_process(
                 "skipped": True,
                 "reason": f"error:{exc}",
             }
-        return vid, link_id, _to_raw_dict(row.get("raw_json")), result
+        return vid, link_id, _to_raw_dict(row.get("raw_json")), result, row
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
         futures = [ex.submit(_run, row) for row in rows]
         for fut in as_completed(futures):
-            vid, link_id, raw, result = fut.result()
+            vid, link_id, raw, result, row = fut.result()
+            vo, co = row.get("video_updated_at"), row.get("content_updated_at")
             if result.get("skipped"):
                 reason = result.get("reason", "")
                 if reason == "already_has_subtitles":
-                    _set_video_status(vid, link_id, "skip")
+                    _set_video_status(vid, link_id, "skip", video_updated_at=vo, content_updated_at=co)
                     execute(
                         "UPDATE qa_link_video SET subtitles = %s WHERE id = %s",
                         (json.dumps(raw.get("subtitles") or [], ensure_ascii=False), vid),
                     )
                 elif reason == "already_has_stt_text":
-                    _set_video_status(vid, link_id, "done")
+                    _set_video_status(vid, link_id, "done", video_updated_at=vo, content_updated_at=co)
                     execute(
                         "UPDATE qa_link_video SET stt_text = %s WHERE id = %s",
                         (raw.get("stt_text", ""), vid),
                     )
                 else:
                     err_msg = str(reason)[:500]
-                    _set_video_status(vid, link_id, "error", err_msg)
+                    _set_video_status(vid, link_id, "error", err_msg, video_updated_at=vo, content_updated_at=co)
                 logger.info("[audio] skip %s: %s", link_id, reason)
                 continue
 
             stt_text = (result.get("stt_text") or "").strip()
             if not stt_text:
-                _set_video_status(vid, link_id, "error", "empty_transcript")
+                _set_video_status(vid, link_id, "error", "empty_transcript", video_updated_at=vo, content_updated_at=co)
                 logger.info("[audio] skip %s: empty stt_text", link_id)
                 continue
 
-            _sync_to_content(vid, link_id, result, raw)
+            _sync_to_content(vid, link_id, result, raw, video_updated_at=vo, content_updated_at=co)
 
             execute(
                 "UPDATE qa_link_video SET fetched_at = CURRENT_TIMESTAMP "

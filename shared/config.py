@@ -9,12 +9,20 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
 
 CONFIG = {
+    "db_type": os.getenv("DB_TYPE", "postgresql").lower(),
     "pg": {
         "host": os.getenv("PGHOST", "localhost"),
         "port": int(os.getenv("PGPORT", "5432")),
         "dbname": os.getenv("PGDATABASE", "doubao"),
         "user": os.getenv("PGUSER", "postgres"),
         "password": os.getenv("PGPASSWORD", "postgres"),
+    },
+    "mysql": {
+        "host": os.getenv("MYSQL_HOST", "localhost"),
+        "port": int(os.getenv("MYSQL_PORT", "3306")),
+        "dbname": os.getenv("MYSQL_DATABASE", "doubao"),
+        "user": os.getenv("MYSQL_USER", "root"),
+        "password": os.getenv("MYSQL_PASSWORD", ""),
     },
     "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379/0"),
     "douyin_api": {

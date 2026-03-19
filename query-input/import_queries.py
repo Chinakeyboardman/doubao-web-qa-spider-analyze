@@ -12,29 +12,19 @@
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
 import openpyxl
-import psycopg2
-from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from shared.db import get_connection, execute as db_execute
+from shared.sql_builder import sb
 
 DEFAULT_XLSX = PROJECT_ROOT / "Query生成_测试集.xlsx"
 SHEET_NAME = "Sheet5_生成结果"
-
-
-def get_connection():
-    return psycopg2.connect(
-        host=os.getenv("PGHOST", "localhost"),
-        port=int(os.getenv("PGPORT", "5432")),
-        dbname=os.getenv("PGDATABASE", "doubao"),
-        user=os.getenv("PGUSER", "root"),
-        password=os.getenv("PGPASSWORD", "123456"),
-    )
 
 
 def parse_xlsx(filepath: Path):
@@ -68,28 +58,28 @@ def import_to_db(records, dry_run=False):
         print(f"  ... 共 {len(records)} 条")
         return
 
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            inserted = 0
-            skipped = 0
-            for r in records:
-                cur.execute(
-                    """
-                    INSERT INTO qa_query (query_id, query_text, category, intent_type, remark)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (query_id) DO NOTHING
-                    """,
-                    (r["query_id"], r["query_text"], r["category"], r["intent_type"], r["remark"]),
-                )
-                if cur.rowcount == 1:
-                    inserted += 1
-                else:
-                    skipped += 1
-            conn.commit()
-        print(f"导入完成: 新增 {inserted} 条, 跳过(已存在) {skipped} 条")
-    finally:
-        conn.close()
+    inserted = 0
+    skipped = 0
+    _ignore_prefix = sb.insert_ignore_prefix()
+    _do_nothing = sb.upsert_do_nothing(["query_id"])
+    for r in records:
+        if sb.is_mysql:
+            n = db_execute(
+                f"{_ignore_prefix} INTO qa_query (query_id, query_text, category, intent_type, remark) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (r["query_id"], r["query_text"], r["category"], r["intent_type"], r["remark"]),
+            )
+        else:
+            n = db_execute(
+                "INSERT INTO qa_query (query_id, query_text, category, intent_type, remark) "
+                f"VALUES (%s, %s, %s, %s, %s) {_do_nothing}",
+                (r["query_id"], r["query_text"], r["category"], r["intent_type"], r["remark"]),
+            )
+        if n == 1:
+            inserted += 1
+        else:
+            skipped += 1
+    print(f"导入完成: 新增 {inserted} 条, 跳过(已存在) {skipped} 条")
 
 
 def main():
