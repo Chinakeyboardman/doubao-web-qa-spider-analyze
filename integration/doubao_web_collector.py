@@ -34,7 +34,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared.config import CONFIG
-from shared.db import execute, fetch_all, fetch_one
+from shared.db import execute, execute_returning, fetch_all, fetch_one
+from shared.sql_builder import sb
 from integration.citation_parser import identify_platform, determine_content_format
 
 logger = logging.getLogger(__name__)
@@ -388,28 +389,40 @@ class DoubaoWebCollector:
     # ------------------------------------------------------------------
     async def collect_one(
         self, query_id: str, query_text: str, *, _skip_claim: bool = False,
+        _query_updated_at=None,
     ) -> dict:
         """Send query, wait for response, extract deep-thinking links.
 
         Returns: {answer_text, deep_thinking_links, all_links, link_ids}
         Args:
             _skip_claim: True when retrying from risk recovery (status already 'processing').
+            _query_updated_at: updated_at from claim (for optimistic lock). Pass from batch_collect.
         """
         logger.info("Web-collecting %s: %s", query_id, query_text[:60])
+        query_updated_at = _query_updated_at
         if not _skip_claim:
-            claimed = execute(
+            row = execute_returning(
                 "UPDATE qa_query SET status = 'processing' "
-                "WHERE query_id = %s AND status = 'pending'",
+                "WHERE query_id = %s AND status = 'pending' "
+                + sb.returning_clause(["updated_at"]),
                 (query_id,),
+                returning_select="SELECT updated_at FROM qa_query WHERE query_id = %s AND status = 'processing'",
+                returning_params=(query_id,),
             )
-            if claimed == 0:
+            if not row:
                 logger.info("Query %s already claimed or done, skipping", query_id)
                 return {"answer_text": "", "deep_thinking_links": [], "all_links": [], "link_ids": [], "skipped": True}
+            query_updated_at = row["updated_at"]
         else:
-            execute(
-                "UPDATE qa_query SET status = 'processing' WHERE query_id = %s",
+            row = execute_returning(
+                "UPDATE qa_query SET status = 'processing' WHERE query_id = %s "
+                + sb.returning_clause(["updated_at"]),
                 (query_id,),
+                returning_select="SELECT updated_at FROM qa_query WHERE query_id = %s",
+                returning_params=(query_id,),
             )
+            if row:
+                query_updated_at = row["updated_at"]
         existing_answer = fetch_one(
             "SELECT id FROM qa_answer WHERE query_id = %s",
             (query_id,),
@@ -457,10 +470,13 @@ class DoubaoWebCollector:
             # has_citation / citation_count 以实际写入 qa_link 的数量为准
             _persist_answer(query_id, answer_text, all_links, citation_count=len(link_ids))
 
-            execute(
-                "UPDATE qa_query SET status = 'done' WHERE query_id = %s",
-                (query_id,),
+            n = execute(
+                "UPDATE qa_query SET status = 'done' WHERE query_id = %s"
+                + (" AND updated_at = %s" if query_updated_at else ""),
+                (query_id, query_updated_at) if query_updated_at else (query_id,),
             )
+            if query_updated_at and n == 0:
+                logger.warning("Query %s optimistic lock failed (done), row was modified by another process", query_id)
             logger.info(
                 "Done %s — %d chars, %d deep links, %d total links",
                 query_id, len(answer_text), len(deep_links), len(all_links),
@@ -473,11 +489,15 @@ class DoubaoWebCollector:
             }
         except Exception as exc:
             logger.exception("Failed %s: %s", query_id, exc)
-            execute(
+            q_params = (str(exc)[:500], query_id, query_updated_at) if query_updated_at else (str(exc)[:500], query_id)
+            n = execute(
                 "UPDATE qa_query SET status = 'error', error_message = %s, "
-                "retry_count = COALESCE(retry_count, 0) + 1 WHERE query_id = %s",
-                (str(exc)[:500], query_id),
+                "retry_count = COALESCE(retry_count, 0) + 1 WHERE query_id = %s"
+                + (" AND updated_at = %s" if query_updated_at else ""),
+                q_params,
             )
+            if query_updated_at and n == 0:
+                logger.warning("Query %s optimistic lock failed (error), row was modified by another process", query_id)
             execute(
                 "UPDATE qa_answer SET status = 'error' WHERE query_id = %s",
                 (query_id,),
@@ -485,10 +505,8 @@ class DoubaoWebCollector:
             raise
 
     async def batch_collect(self, batch_size: int = 5) -> list[str]:
-        rows = fetch_all(
-            "SELECT * FROM claim_pending_queries(%s)",
-            (batch_size,),
-        )
+        from shared.claim_functions import claim_pending_queries
+        rows = claim_pending_queries(batch_size)
         if not rows:
             logger.info("No pending queries")
             return []
@@ -496,7 +514,10 @@ class DoubaoWebCollector:
         done: list[str] = []
         for i, row in enumerate(rows):
             try:
-                await self.collect_one(row["query_id"], row["query_text"])
+                await self.collect_one(
+                    row["query_id"], row["query_text"],
+                    _query_updated_at=row.get("updated_at"),
+                )
                 done.append(row["query_id"])
             except Exception:
                 logger.exception("Failed %s", row["query_id"])
@@ -1194,18 +1215,17 @@ def _persist_links(query_id: str, links: list[dict]) -> list[str]:
             "SELECT link_url, platform, content_format FROM qa_link WHERE link_id = %s",
             (link_id,),
         )
+        _upsert_suffix = sb.upsert_suffix(
+            ["link_id"],
+            ["query_id", "link_url", "platform", "content_format"],
+        )
         n = execute(
             "INSERT INTO qa_link "
             "(query_id, link_id, link_url, platform, content_format, status) "
             "VALUES (%s, %s, %s, %s, %s, 'pending') "
-            "ON CONFLICT (link_id) DO UPDATE SET "
-            "query_id=EXCLUDED.query_id, link_url=EXCLUDED.link_url, "
-            "platform=EXCLUDED.platform, content_format=EXCLUDED.content_format, "
-            # Reset crawl-derived fields to avoid stale carry-over when same
-            # link_id is reused for a different URL/platform in later runs.
-            "publish_time=NULL, popularity=NULL, fetched_at=NULL, "
-            "status='pending', "
-            "updated_at=CURRENT_TIMESTAMP",
+            + _upsert_suffix
+            + ", publish_time=NULL, popularity=NULL, fetched_at=NULL, "
+            "status='pending', updated_at=CURRENT_TIMESTAMP",
             (query_id, link_id, url, platform, content_format),
         )
         # If link target/type changed for same link_id, old content_json becomes stale.
@@ -1224,9 +1244,10 @@ def _persist_links(query_id: str, links: list[dict]) -> list[str]:
         logger.info("Persisted %d reference links to qa_link for %s", len(link_ids), query_id)
     # Remove stale tail links when current extraction has fewer links than
     # previous runs of the same query (e.g., old Q0001_L021~L030).
+    not_frag, not_params = sb.expand_not_all("link_id", link_ids or [""])
     stale_rows = fetch_all(
-        "SELECT link_id FROM qa_link WHERE query_id = %s AND link_id <> ALL(%s)",
-        (query_id, link_ids or [""]),
+        f"SELECT link_id FROM qa_link WHERE query_id = %s AND {not_frag}",
+        (query_id, *not_params),
     )
     for row in stale_rows:
         stale_id = row["link_id"]

@@ -7,7 +7,7 @@
 | 抖音视频下载 | **本地进程部署** | pip 安装依赖 + `python start.py` 启动 FastAPI 服务 |
 | 豆包web爬虫 | **目录纳入** | 直接放在父项目下，作为子目录 |
 | 配置 | **父目录统一** | 根目录 `.env` |
-| 数据库 | **同一 PG 实例、同一数据库** | 各项目共用一个库，新业务表加前缀区分 |
+| 数据库 | **PostgreSQL 或 MySQL（`DB_TYPE` 切换）** | 各项目共用一个库，新业务表加前缀区分 |
 | 部署方式 | **常规 Linux 部署** | PG、Redis 用系统服务，各项目用本地进程，不用 Docker |
 
 ### 开源项目保护原则（重要）
@@ -25,12 +25,22 @@ doubao-web-qa-spider-analyze/
 ├── .env                        # 实际配置（gitignore）
 ├── requirements.txt            # 根依赖（Phase 4 新增）
 ├── docker-compose.yml          # 父项目编排（PG、Redis、抖音下载服务）
-├── init-db/                    # 新业务表初始化脚本（qa_ 前缀的表）
-│   ├── init.sql
-│   └── migrate_v2.sql          # Phase 4：status 字段迁移
-├── shared/                     # 共享工具模块（Phase 4 新增）
-│   ├── config.py               # .env 配置加载
-│   ├── db.py                   # PG 连接 + CRUD
+├── init-db/                    # 数据库初始化脚本
+│   ├── postgresql/             # PostgreSQL DDL + 迁移脚本
+│   │   ├── init.sql
+│   │   └── migrate_v2~v8.sql
+│   └── mysql/                  # MySQL DDL
+│       └── init.sql
+├── shared/                     # 共享工具模块
+│   ├── config.py               # .env 配置加载（含 DB_TYPE）
+│   ├── db.py                   # 数据库操作门面（PostgreSQL / MySQL 双引擎）
+│   ├── db_backend/             # 数据库后端抽象
+│   │   ├── __init__.py         # get_backend() 工厂
+│   │   ├── base.py             # DBBackend 抽象基类
+│   │   ├── postgresql.py       # psycopg2 后端
+│   │   └── mysql.py            # PyMySQL 后端
+│   ├── sql_builder.py          # 跨方言 SQL 构建器（单例 sb）
+│   ├── claim_functions.py      # claim_pending_* Python 实现
 │   └── volcengine_llm.py       # 火山云 LLM 封装
 ├── douyin-crawler/             # 抖音爬虫（原样保留，不修改）
 ├── Douyin_TikTok_Download_API/ # 抖音视频下载（原样保留，独立部署）
@@ -271,6 +281,36 @@ doubao-web-qa-spider-analyze/
 - [x] **下载/ffmpeg 优化**：`download_video` 对 RemoteProtocolError/ConnectError 自动重试一次；`process_one` 在 ffmpeg 提取失败时回退 Seed2（视频文件），再失败用 raw_text 兜底
 - [x] **瞬时错误重置**：用代码执行重置时，除 Connection refused/Errno 61 外，可包含 `%peer closed connection%`、`%RemoteProtocol%`、`%quota exceeded for types: concurrency%`，便于重跑
 
+#### 4.14 MySQL 双数据库适配 ✅
+
+- [x] **架构设计**：`shared/db.py` 公共 API（`execute`/`fetch_all`/`fetch_one`/`execute_returning`/`get_cursor`/`get_connection`）保持不变，底层通过 `shared/db_backend/` 工厂模式分发到 PostgreSQL 或 MySQL 后端
+- [x] `shared/config.py`：新增 `DB_TYPE`（`postgresql`/`mysql`，默认 `postgresql`）及 `mysql` 配置块（`MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_DATABASE`/`MYSQL_USER`/`MYSQL_PASSWORD`）
+- [x] `shared/db_backend/`：新建后端包（`base.py` 抽象基类 + `postgresql.py` psycopg2 + `mysql.py` PyMySQL）；MySQL 后端自动将 JSON 字符串反序列化为 Python dict
+- [x] `shared/db.py`：重构为使用 `get_backend()` 工厂；`execute_returning` 新增 `returning_select` 参数适配 MySQL 无 RETURNING 场景
+- [x] `shared/sql_builder.py`：15+ 跨方言 SQL 工具（`upsert_suffix`/`expand_any`/`expand_not_all`/`returning_clause`/`interval_ago`/`count_filter`/`json_extract_text`/`json_extract`/`json_array_length`/`json_key_exists`/`cast_int` 等），模块级单例 `sb`
+- [x] `shared/claim_functions.py`：`claim_pending_queries`/`claim_pending_links`/`claim_pending_video_parse_v2` 三个 PG 存储函数的 Python 实现，使用 `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE`（MySQL 8.0+ 同样支持）
+- [x] 调用层迁移（15+ 文件）：所有 PG 专有语法替换为 `sql_builder` 跨方言写法
+  - `ON CONFLICT ... DO UPDATE SET ... = EXCLUDED.col` → `sb.upsert_suffix()` / MySQL `ON DUPLICATE KEY UPDATE ... = VALUES(col)`
+  - `ANY(%s)` / `<> ALL(%s)` → `sb.expand_any()` / `sb.expand_not_all()`
+  - `COUNT(*) FILTER (WHERE ...)` → `sb.count_filter()`
+  - `CURRENT_TIMESTAMP - INTERVAL '2 hours'` → `sb.interval_ago(2)`
+  - `col->>'key'` / `jsonb_array_length()` / `col ? 'key'` → `sb.json_extract_text()` / `sb.json_array_length()` / `sb.json_key_exists()`
+  - `(expr)::INTEGER` → `sb.cast_int()`
+  - `UPDATE ... FROM ...` (PG) → `UPDATE ... JOIN ...` (MySQL)
+- [x] 存储函数调用替换：4 处 `SELECT * FROM claim_pending_*()` → Python 函数直调
+- [x] `init-db/` 目录重构：现有脚本复制到 `init-db/postgresql/`；新建 `init-db/mysql/init.sql`（`AUTO_INCREMENT`/`JSON`/`ON UPDATE CURRENT_TIMESTAMP` 等 MySQL 语法）
+- [x] `scripts/run_migrations.py`：按 `DB_TYPE` 自动选择 `init-db/postgresql/` 或 `init-db/mysql/` 下的脚本执行
+- [x] `requirements.txt`：新增 `pymysql>=1.1.0`
+- [x] `.env.example`：新增 `DB_TYPE`/`MYSQL_HOST`/`MYSQL_PORT`/`MYSQL_DATABASE`/`MYSQL_USER`/`MYSQL_PASSWORD`
+- [x] 新增测试：`tests/test_sql_builder.py`（30 项，覆盖两种方言全部 helper）+ `tests/test_db_backend.py`（6 项，后端工厂 + MySQL JSON 适配）
+- [x] 原有测试全部通过：70 passed, 1 skipped（mock 层不受影响，公共 API 无变化）
+
+##### 关键约束
+- MySQL 版本要求 **8.0+**（依赖 `FOR UPDATE SKIP LOCKED`、`CHECK` 约束、`JSON` 函数）
+- 默认 `DB_TYPE=postgresql`，不配置时行为与改造前完全一致（向后兼容）
+- PG 的 JSONB 自动转 dict，MySQL 的 JSON 返回字符串 → 在 `MySQLBackend.adapt_row()` 统一处理
+- PG `UPDATE ... FROM ...` 语法在 MySQL 需改为 `UPDATE ... JOIN ...`，涉及 `pipeline.py` 中 3 处
+
 ---
 
 ## 五、子项目清单（7个）
@@ -280,7 +320,7 @@ doubao-web-qa-spider-analyze/
 | 1 | query-input | `query-input/` | ✅ 已完成 | openpyxl + psycopg2，Excel 导入 |
 | 2 | 抖音爬虫 | `douyin-crawler/` | 已有 | Node + Python + Celery，目录纳入 |
 | 3 | 抖音视频下载 | `Douyin_TikTok_Download_API/` | 已有 | FastAPI，pip + 本地进程部署 |
-| 4 | 共享模块 | `shared/` | ✅ 已完成 | python-dotenv + psycopg2 + langchain-openai |
+| 4 | 共享模块 | `shared/` | ✅ 已完成 | python-dotenv + psycopg2 + pymysql + langchain-openai |
 | 5 | 业务编排 | `integration/` | ✅ 已完成 | 火山云 API + 流水线 CLI |
 | 6 | 网站爬虫 | `web-crawler/` | ✅ 已完成 | httpx + BeautifulSoup + 调用 Download API |
 | 7 | 数据清洗 | `data-clean/` | ✅ 已完成 | JSON 格式化 + LLM 辅助提取 |

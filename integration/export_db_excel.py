@@ -16,13 +16,13 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import psycopg2.extras
 from openpyxl import Workbook
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared.db import get_connection
+from shared.db_backend import get_backend
 
 # (table_name, order_column, where_clause) — 导出 status 为 done 或 error 的数据
 CORE_TABLES: list[tuple[str, str, str]] = [
@@ -59,18 +59,19 @@ def export_table(
 ) -> int:
     """Stream one table into one worksheet."""
     ws = wb.create_sheet(title=table_name[:31])
+    backend = get_backend()
 
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as meta_cur:
+    meta_cur = backend.get_dict_cursor(conn)
+    try:
+        schema_filter = "table_schema = 'public' AND " if backend.dialect() == "postgresql" else ""
         meta_cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s
-            ORDER BY ordinal_position
-            """,
+            f"SELECT column_name FROM information_schema.columns "
+            f"WHERE {schema_filter}table_name = %s ORDER BY ordinal_position",
             (table_name,),
         )
         columns = [row["column_name"] for row in meta_cur.fetchall()]
+    finally:
+        meta_cur.close()
 
     if not columns:
         ws.append(["warning", f"table {table_name} not found"])
@@ -83,17 +84,20 @@ def export_table(
     if where_clause:
         sql += f" WHERE {where_clause}"
     sql += f" ORDER BY {order_column}"
-    with conn.cursor(name=f"export_{table_name}", cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.itersize = batch_size
-        cur.execute(sql)
+    ss_cur = backend.get_server_side_cursor(conn, f"export_{table_name}", itersize=batch_size)
+    try:
+        ss_cur.execute(sql)
         while True:
-            rows = cur.fetchmany(batch_size)
+            rows = ss_cur.fetchmany(batch_size)
             if not rows:
                 break
+            rows = backend.adapt_rows([dict(r) if not isinstance(r, dict) else r for r in rows])
             for row in rows:
                 ws.append([normalize_value(row.get(col)) for col in columns])
             total += len(rows)
             print(f"[{table_name}] exported {total} rows...")
+    finally:
+        ss_cur.close()
     return total
 
 

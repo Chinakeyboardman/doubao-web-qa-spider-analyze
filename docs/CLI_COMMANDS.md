@@ -255,6 +255,8 @@ psql -h localhost -U root -d doubao -f init-db/init.sql
 psql -h localhost -U root -d doubao -f init-db/migrate_v2.sql
 psql -h localhost -U root -d doubao -f init-db/migrate_v3.sql
 psql -h localhost -U root -d doubao -f init-db/migrate_v6.sql
+psql -h localhost -U root -d doubao -f init-db/migrate_v7.sql
+psql -h localhost -U root -d doubao -f init-db/migrate_v8.sql  # 乐观锁
 ```
 
 ---

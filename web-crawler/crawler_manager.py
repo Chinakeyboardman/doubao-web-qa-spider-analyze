@@ -20,6 +20,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared.db import execute, fetch_all
+from shared.sql_builder import sb
 from integration.parsing_routing import should_crawl_content
 from crawlers.base import BaseCrawler
 from crawlers.generic_web import GenericWebCrawler
@@ -84,10 +85,8 @@ class CrawlerManager:
 
         Returns list of successfully crawled link_ids.
         """
-        rows = fetch_all(
-            "SELECT * FROM claim_pending_links(%s, %s)",
-            (batch_size, query_ids),
-        )
+        from shared.claim_functions import claim_pending_links
+        rows = claim_pending_links(batch_size, query_ids=query_ids)
         if not rows:
             logger.debug("No pending links to crawl.")
             return []
@@ -102,32 +101,49 @@ class CrawlerManager:
                     raw_content = await self.crawl_link(row)
                 self._save_raw_content(link_id, raw_content)
 
+                link_updated_at = row.get("updated_at")
+                ol = " AND updated_at = %s" if link_updated_at else ""
                 if raw_content.get("skipped"):
-                    execute(
-                        "UPDATE qa_link SET status = 'done' WHERE link_id = %s",
-                        (link_id,),
+                    params = (link_id, link_updated_at) if link_updated_at else (link_id,)
+                    n = execute(
+                        f"UPDATE qa_link SET status = 'done' WHERE link_id = %s{ol}",
+                        params,
                     )
+                    if link_updated_at and n == 0:
+                        logger.warning("Link %s optimistic lock failed (done/skip)", link_id)
                 elif raw_content.get("error"):
                     err_msg = str(raw_content.get("error", ""))[:500]
-                    execute(
+                    params = (err_msg, link_id, link_updated_at) if link_updated_at else (err_msg, link_id)
+                    n = execute(
                         "UPDATE qa_link SET status = 'error', error_message = %s, "
-                        "retry_count = retry_count + 1 WHERE link_id = %s",
-                        (err_msg, link_id),
+                        f"retry_count = retry_count + 1 WHERE link_id = %s{ol}",
+                        params,
                     )
+                    if link_updated_at and n == 0:
+                        logger.warning("Link %s optimistic lock failed (error)", link_id)
                 else:
-                    execute(
+                    params = (link_id, link_updated_at) if link_updated_at else (link_id,)
+                    n = execute(
                         "UPDATE qa_link SET status = 'done', fetched_at = CURRENT_TIMESTAMP "
-                        "WHERE link_id = %s",
-                        (link_id,),
+                        f"WHERE link_id = %s{ol}",
+                        params,
                     )
-                    return link_id
+                    if link_updated_at and n == 0:
+                        logger.warning("Link %s optimistic lock failed (done)", link_id)
+                    else:
+                        return link_id
             except Exception as exc:
                 logger.exception("Unexpected error crawling %s", link_id)
-                execute(
+                link_updated_at = row.get("updated_at")
+                ol = " AND updated_at = %s" if link_updated_at else ""
+                params = (str(exc)[:500], link_id, link_updated_at) if link_updated_at else (str(exc)[:500], link_id)
+                n = execute(
                     "UPDATE qa_link SET status = 'error', error_message = %s, "
-                    "retry_count = retry_count + 1 WHERE link_id = %s",
-                    (str(exc)[:500], link_id),
+                    f"retry_count = retry_count + 1 WHERE link_id = %s{ol}",
+                    params,
                 )
+                if link_updated_at and n == 0:
+                    logger.warning("Link %s optimistic lock failed (error)", link_id)
             return None
 
         logger.info("Batch crawl start: total=%d, concurrency=%d", len(rows), max(1, int(concurrency or 1)))
@@ -163,21 +179,37 @@ class CrawlerManager:
                 return
 
         raw_json_str = json.dumps(raw_content, ensure_ascii=False)
-        execute(
-            "INSERT INTO qa_link_content (link_id, raw_json, content_json, video_parse_status, status) "
-            "VALUES ("
-            "%s, %s, NULL, "
-            "(SELECT CASE WHEN l.platform = '抖音' THEN 'pending' ELSE NULL END "
-            " FROM qa_link l WHERE l.link_id = %s), "
-            "%s"
-            ") "
-            "ON CONFLICT (link_id) DO UPDATE SET "
-            "raw_json = EXCLUDED.raw_json, content_json = NULL, status = EXCLUDED.status, "
-            "video_parse_status = CASE "
-            "WHEN (SELECT platform FROM qa_link l WHERE l.link_id = EXCLUDED.link_id) = '抖音' "
-            "THEN 'pending' ELSE NULL END",
-            (link_id, raw_json_str, link_id, content_status),
-        )
+        if sb.is_pg:
+            execute(
+                "INSERT INTO qa_link_content (link_id, raw_json, content_json, video_parse_status, status) "
+                "VALUES ("
+                "%s, %s, NULL, "
+                "(SELECT CASE WHEN l.platform = '抖音' THEN 'pending' ELSE NULL END "
+                " FROM qa_link l WHERE l.link_id = %s), "
+                "%s"
+                ") "
+                "ON CONFLICT (link_id) DO UPDATE SET "
+                "raw_json = EXCLUDED.raw_json, content_json = NULL, status = EXCLUDED.status, "
+                "video_parse_status = CASE "
+                "WHEN (SELECT platform FROM qa_link l WHERE l.link_id = EXCLUDED.link_id) = '抖音' "
+                "THEN 'pending' ELSE NULL END",
+                (link_id, raw_json_str, link_id, content_status),
+            )
+        else:
+            vps_row = fetch_all(
+                "SELECT CASE WHEN l.platform = '抖音' THEN 'pending' ELSE NULL END AS vps "
+                "FROM qa_link l WHERE l.link_id = %s",
+                (link_id,),
+            )
+            vps = vps_row[0]["vps"] if vps_row else None
+            execute(
+                "INSERT INTO qa_link_content (link_id, raw_json, content_json, video_parse_status, status) "
+                "VALUES (%s, %s, NULL, %s, %s) "
+                "ON DUPLICATE KEY UPDATE "
+                "raw_json = VALUES(raw_json), content_json = NULL, status = VALUES(status), "
+                "video_parse_status = VALUES(video_parse_status)",
+                (link_id, raw_json_str, vps, content_status),
+            )
 
         _upsert_link_video(link_id, raw_content)
 
@@ -200,32 +232,60 @@ def _upsert_link_video(link_id: str, raw_content: dict) -> None:
     )
     initial_status = "skip" if has_subtitles else "pending"
 
-    execute(
-        "INSERT INTO qa_link_video "
-        "(link_id, model_api_input_type, video_id, play_url, cover_url, duration, subtitles, "
-        " raw_api_response, status, fetched_at) "
-        "VALUES (%s, 'input_audio', %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP) "
-        "ON CONFLICT (link_id, model_api_input_type) DO UPDATE SET "
-        "video_id   = COALESCE(NULLIF(EXCLUDED.video_id, ''), qa_link_video.video_id), "
-        "play_url   = COALESCE(NULLIF(EXCLUDED.play_url, ''), qa_link_video.play_url), "
-        "cover_url  = COALESCE(NULLIF(EXCLUDED.cover_url, ''), qa_link_video.cover_url), "
-        "duration   = GREATEST(EXCLUDED.duration, qa_link_video.duration), "
-        "subtitles  = COALESCE(EXCLUDED.subtitles, qa_link_video.subtitles), "
-        "raw_api_response = COALESCE(EXCLUDED.raw_api_response, qa_link_video.raw_api_response), "
-        "fetched_at = COALESCE(qa_link_video.fetched_at, EXCLUDED.fetched_at), "
-        "status     = CASE WHEN qa_link_video.status IN ('done','skip') "
-        "            THEN qa_link_video.status ELSE EXCLUDED.status END",
-        (
-            link_id,
-            vi.get("aweme_id") or "",
-            vi.get("play_url") or "",
-            vi.get("cover_url") or "",
-            int(vi.get("duration") or 0),
-            json.dumps(subtitles, ensure_ascii=False) if subtitles else None,
-            json.dumps(raw_content, ensure_ascii=False),
-            initial_status,
-        ),
-    )
+    if sb.is_pg:
+        execute(
+            "INSERT INTO qa_link_video "
+            "(link_id, model_api_input_type, video_id, play_url, cover_url, duration, subtitles, "
+            " raw_api_response, status, fetched_at) "
+            "VALUES (%s, 'input_audio', %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP) "
+            "ON CONFLICT (link_id, model_api_input_type) DO UPDATE SET "
+            "video_id   = COALESCE(NULLIF(EXCLUDED.video_id, ''), qa_link_video.video_id), "
+            "play_url   = COALESCE(NULLIF(EXCLUDED.play_url, ''), qa_link_video.play_url), "
+            "cover_url  = COALESCE(NULLIF(EXCLUDED.cover_url, ''), qa_link_video.cover_url), "
+            "duration   = GREATEST(EXCLUDED.duration, qa_link_video.duration), "
+            "subtitles  = COALESCE(EXCLUDED.subtitles, qa_link_video.subtitles), "
+            "raw_api_response = COALESCE(EXCLUDED.raw_api_response, qa_link_video.raw_api_response), "
+            "fetched_at = COALESCE(qa_link_video.fetched_at, EXCLUDED.fetched_at), "
+            "status     = CASE WHEN qa_link_video.status IN ('done','skip') "
+            "            THEN qa_link_video.status ELSE EXCLUDED.status END",
+            (
+                link_id,
+                vi.get("aweme_id") or "",
+                vi.get("play_url") or "",
+                vi.get("cover_url") or "",
+                int(vi.get("duration") or 0),
+                json.dumps(subtitles, ensure_ascii=False) if subtitles else None,
+                json.dumps(raw_content, ensure_ascii=False),
+                initial_status,
+            ),
+        )
+    else:
+        execute(
+            "INSERT INTO qa_link_video "
+            "(link_id, model_api_input_type, video_id, play_url, cover_url, duration, subtitles, "
+            " raw_api_response, status, fetched_at) "
+            "VALUES (%s, 'input_audio', %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP) "
+            "ON DUPLICATE KEY UPDATE "
+            "video_id   = COALESCE(NULLIF(VALUES(video_id), ''), video_id), "
+            "play_url   = COALESCE(NULLIF(VALUES(play_url), ''), play_url), "
+            "cover_url  = COALESCE(NULLIF(VALUES(cover_url), ''), cover_url), "
+            "duration   = GREATEST(VALUES(duration), duration), "
+            "subtitles  = COALESCE(VALUES(subtitles), subtitles), "
+            "raw_api_response = COALESCE(VALUES(raw_api_response), raw_api_response), "
+            "fetched_at = COALESCE(fetched_at, VALUES(fetched_at)), "
+            "status     = CASE WHEN status IN ('done','skip') "
+            "            THEN status ELSE VALUES(status) END",
+            (
+                link_id,
+                vi.get("aweme_id") or "",
+                vi.get("play_url") or "",
+                vi.get("cover_url") or "",
+                int(vi.get("duration") or 0),
+                json.dumps(subtitles, ensure_ascii=False) if subtitles else None,
+                json.dumps(raw_content, ensure_ascii=False),
+                initial_status,
+            ),
+        )
 
 
 def _is_shell_payload(raw: dict) -> bool:

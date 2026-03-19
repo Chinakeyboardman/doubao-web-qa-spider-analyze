@@ -1,12 +1,10 @@
-"""Douyin audio transcription pipeline (ASR-first with Seed2 fallback)."""
+"""抖音视频音频转写流水线：下载 → ffmpeg 抽音频 → OSS 上传 → SeedASR 2.0 转写。"""
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
-import re
 import subprocess
 import time
 import uuid
@@ -15,11 +13,12 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+import requests as _requests
 
 from shared.config import CONFIG
 from shared.db import execute, fetch_all
-from shared.utils import to_raw_dict, has_meaningful_subtitles
-from shared.volcengine_llm import get_seed2_client
+from shared.oss import upload_file as oss_upload, get_public_url as oss_url
+from shared.utils import to_raw_dict, has_meaningful_subtitles, extract_video_id_from_url, resolve_video_id
 
 logger = logging.getLogger(__name__)
 
@@ -27,75 +26,32 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _EXPORT_ROOT = _PROJECT_ROOT / "export"
 _MEDIA_DIR = _EXPORT_ROOT / "media"
 _DEFAULT_API_BASE = CONFIG.get("douyin_api", {}).get("url", "http://localhost:8081")
-_SEED2_MODEL = (
-    os.getenv("VOLCENGINE_AUDIO_MODEL", "").strip()
-    or CONFIG.get("volcengine", {}).get("seedance_model")
-    or CONFIG.get("volcengine", {}).get("seed_model", "")
-)
-_MAX_AUDIO_MB = int(os.getenv("DOUYIN_AUDIO_MAX_MB", "10"))
-_MAX_VIDEO_MB = int(os.getenv("DOUYIN_VIDEO_MAX_MB", "80"))
+
 _MAX_PROMPT_AUDIO_CHARS = int(os.getenv("DOUYIN_AUDIO_MAX_TRANSCRIPT_CHARS", "6000"))
-_FILE_PROCESS_MAX_WAIT_SECONDS = int(os.getenv("DOUYIN_FILE_PROCESS_MAX_WAIT_SECONDS", "900"))
-_FILE_PROCESS_POLL_INTERVAL_SECONDS = int(os.getenv("DOUYIN_FILE_PROCESS_POLL_INTERVAL_SECONDS", "20"))
-_FILE_PROCESS_MAX_POLL_INTERVAL_SECONDS = int(os.getenv("DOUYIN_FILE_PROCESS_MAX_POLL_INTERVAL_SECONDS", "60"))
-_ASR_TIMEOUT_SECONDS = int(os.getenv("VOLCENGINE_ASR_TIMEOUT_SECONDS", "180"))
-_ASR_MODEL_NAME = (os.getenv("VOLCENGINE_ASR_MODEL_NAME", "bigmodel") or "bigmodel").strip()
-_FILE_ID_RE = re.compile(r"file-[A-Za-z0-9-]+")
-_ASR_ENDPOINT = CONFIG.get("asr", {}).get(
-    "endpoint",
-    "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",
-)
+_ASR_TIMEOUT_SECONDS = int(os.getenv("VOLCENGINE_ASR_TIMEOUT_SECONDS", "300"))
+
 _ASR_APP_ID = (CONFIG.get("asr", {}).get("app_id") or "").strip()
 _ASR_ACCESS_TOKEN = (CONFIG.get("asr", {}).get("access_token") or "").strip()
-_ASR_RESOURCE_ID = (CONFIG.get("asr", {}).get("resource_id") or "volc.bigasr.auc_turbo").strip()
-
+_ASR_RESOURCE_ID = (CONFIG.get("asr", {}).get("resource_id") or "volc.seedasr.auc").strip()
+_ASR_SUBMIT_URL = CONFIG.get("asr", {}).get(
+    "submit_url",
+    "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit",
+)
+_ASR_QUERY_URL = CONFIG.get("asr", {}).get(
+    "query_url",
+    "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query",
+)
 
 _to_raw_dict = to_raw_dict
 _has_meaningful_subtitles = has_meaningful_subtitles
 
 
-def _extract_text_from_response(resp) -> str:
-    """Best-effort extraction for Responses API object."""
-    output_text = getattr(resp, "output_text", None)
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-
-    payload = None
-    if hasattr(resp, "model_dump"):
-        try:
-            payload = resp.model_dump()
-        except Exception:
-            payload = None
-    if payload is None:
-        payload = getattr(resp, "__dict__", {})
-
-    collected: list[str] = []
-
-    def _walk(node):
-        if isinstance(node, dict):
-            txt = node.get("text")
-            if isinstance(txt, str) and txt.strip():
-                collected.append(txt.strip())
-            for v in node.values():
-                _walk(v)
-            return
-        if isinstance(node, list):
-            for it in node:
-                _walk(it)
-            return
-        if isinstance(node, str):
-            # avoid collecting every random field string by requiring non-trivial text
-            if len(node.strip()) > 8:
-                collected.append(node.strip())
-
-    _walk(payload)
-    if not collected:
-        return ""
-    return "\n".join(collected).strip()
-
+# ---------------------------------------------------------------------------
+# 视频下载 & 音频提取（保留原有逻辑）
+# ---------------------------------------------------------------------------
 
 def download_video(link_url: str, api_base: str, output_path: Path) -> Path:
-    """Download Douyin video using local download API. Retry once on connection/partial body errors."""
+    """通过本地下载 API 下载抖音视频，连接失败重试一次。"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     download_url = f"{api_base}/api/download?url={quote(link_url)}&with_watermark=false"
     last_err: Exception | None = None
@@ -133,20 +89,11 @@ def download_video(link_url: str, api_base: str, output_path: Path) -> Path:
 
 
 def extract_compress_audio(video_path: Path, audio_path: Path) -> Path:
-    """Extract audio directly to compressed mp3 (16k mono 64kbps)."""
+    """用 ffmpeg 从视频中提取音频并压缩为 mp3（16kHz 单声道 64kbps）。"""
     audio_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(video_path),
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-b:a",
-        "64k",
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
         str(audio_path),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -155,73 +102,103 @@ def extract_compress_audio(video_path: Path, audio_path: Path) -> Path:
     return audio_path
 
 
-def _looks_audio_not_supported_error(err_text: str) -> bool:
-    text = (err_text or "").lower()
-    return (
-        "input_audio" in text
-        or "audio input is not supported" in text
-        or ("audio" in text and "not supported" in text)
-    )
+# ---------------------------------------------------------------------------
+# 大模型录音文件识别标准版 API 2.0（SeedASR，提交+查询两步模式）
+# ---------------------------------------------------------------------------
 
-
-def _extract_file_id_from_error(err_text: str) -> str:
-    m = _FILE_ID_RE.search(err_text or "")
-    return m.group(0) if m else ""
-
-
-def _safe_transcript_model_name(model: str) -> str:
-    """Avoid exposing endpoint id like ep-xxxx in stored metadata."""
-    m = (model or "").strip()
-    if not m:
-        return "seed2"
-    if m.startswith("ep-"):
-        return "seed2"
-    return m
-
-
-def transcribe_with_volcengine_asr(audio_path: Path) -> tuple[str, list[dict], int]:
-    """Use Volcengine Flash ASR with base64 audio payload.
-
-    Returns (transcript_text, subtitle_entries, duration_ms).
-    """
-    if not _ASR_APP_ID or not _ASR_ACCESS_TOKEN:
-        raise RuntimeError("VOLCENGINE_ASR_APP_ID / VOLCENGINE_ASR_ACCESS_TOKEN is empty")
-    if not audio_path.exists():
-        raise RuntimeError(f"audio file not found: {audio_path}")
-
-    payload_audio = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
-    headers = {
+def _build_asr_headers(request_id: str) -> dict[str, str]:
+    return {
         "X-Api-App-Key": _ASR_APP_ID,
         "X-Api-Access-Key": _ASR_ACCESS_TOKEN,
         "X-Api-Resource-Id": _ASR_RESOURCE_ID,
-        "X-Api-Request-Id": str(uuid.uuid4()),
+        "X-Api-Request-Id": request_id,
         "X-Api-Sequence": "-1",
     }
-    request = {
+
+
+def transcribe_with_seedasr_v2(
+    audio_url: str,
+    audio_format: str = "mp3",
+) -> tuple[str, list[dict], int]:
+    """使用火山引擎 SeedASR 2.0 标准版进行录音文件识别。
+
+    两步模式：先提交任务，再轮询查询结果。
+    返回 (transcript_text, subtitle_entries, duration_ms)。
+    """
+    if not _ASR_APP_ID or not _ASR_ACCESS_TOKEN:
+        raise RuntimeError("VOLCENGINE_ASR_APP_ID / VOLCENGINE_ASR_ACCESS_TOKEN 未配置")
+
+    request_id = str(uuid.uuid4())
+    headers = _build_asr_headers(request_id)
+
+    # ---- 第 1 步：提交任务 ----
+    submit_body = {
         "user": {"uid": _ASR_APP_ID},
-        "audio": {"data": payload_audio},
-        "request": {"model_name": _ASR_MODEL_NAME},
+        "audio": {
+            "format": audio_format,
+            "url": audio_url,
+        },
+        "request": {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "enable_punc": True,
+            "show_utterances": True,
+        },
     }
-    import requests as _requests
 
     resp = _requests.post(
-        _ASR_ENDPOINT, json=request, headers=headers, timeout=_ASR_TIMEOUT_SECONDS,
+        _ASR_SUBMIT_URL, json=submit_body, headers=headers, timeout=60,
     )
-    if "X-Api-Status-Code" not in resp.headers:
-        raise RuntimeError(
-            f"flash asr: missing status header, http={resp.status_code}, headers={dict(resp.headers)}"
-        )
-    api_status = (resp.headers.get("X-Api-Status-Code") or "").strip()
-    if api_status != "20000000":
+    status_code = (resp.headers.get("X-Api-Status-Code") or "").strip()
+    if status_code != "20000000":
         api_msg = (resp.headers.get("X-Api-Message") or "").strip()
         logid = (resp.headers.get("X-Tt-Logid") or "").strip()
         raise RuntimeError(
-            f"flash asr failed: status={api_status} message={api_msg} logid={logid} body={resp.text[:500]}"
+            f"SeedASR submit failed: status={status_code} message={api_msg} logid={logid}"
         )
+    logger.info("[asr] 任务已提交: request_id=%s", request_id)
 
-    body = resp.json()
+    # ---- 第 2 步：轮询查询结果 ----
+    query_headers = _build_asr_headers(request_id)
+    poll_interval = 3.0
+    max_poll_interval = 15.0
+    start_time = time.time()
+
+    while True:
+        if time.time() - start_time > _ASR_TIMEOUT_SECONDS:
+            raise RuntimeError(
+                f"SeedASR 查询超时: 已等待 {_ASR_TIMEOUT_SECONDS}s, request_id={request_id}"
+            )
+
+        time.sleep(poll_interval)
+        poll_interval = min(max_poll_interval, poll_interval * 1.5)
+
+        query_resp = _requests.post(
+            _ASR_QUERY_URL, json={}, headers=query_headers, timeout=60,
+        )
+        q_status = (query_resp.headers.get("X-Api-Status-Code") or "").strip()
+
+        if q_status in ("20000001", "20000002"):
+            logger.debug("[asr] 任务处理中: status=%s, request_id=%s", q_status, request_id)
+            continue
+
+        if q_status == "20000003":
+            raise RuntimeError(f"SeedASR 返回静音音频: request_id={request_id}")
+
+        if q_status != "20000000":
+            api_msg = (query_resp.headers.get("X-Api-Message") or "").strip()
+            logid = (query_resp.headers.get("X-Tt-Logid") or "").strip()
+            raise RuntimeError(
+                f"SeedASR query failed: status={q_status} message={api_msg} logid={logid}"
+            )
+
+        break
+
+    # ---- 解析结果 ----
+    body = query_resp.json()
     result = body.get("result") or {}
     text = (result.get("text") or "").strip()
+
     utterances = result.get("utterances") or []
     subtitles: list[dict] = []
     if isinstance(utterances, list):
@@ -231,13 +208,11 @@ def transcribe_with_volcengine_asr(audio_path: Path) -> tuple[str, list[dict], i
             line_text = (item.get("text") or "").strip()
             if not line_text:
                 continue
-            subtitles.append(
-                {
-                    "start_time": item.get("start_time", ""),
-                    "end_time": item.get("end_time", ""),
-                    "text": line_text,
-                }
-            )
+            subtitles.append({
+                "start_time": item.get("start_time", ""),
+                "end_time": item.get("end_time", ""),
+                "text": line_text,
+            })
 
     duration = body.get("audio_info", {}).get("duration")
     if not duration:
@@ -251,97 +226,27 @@ def transcribe_with_volcengine_asr(audio_path: Path) -> tuple[str, list[dict], i
         text = " ".join([s["text"] for s in subtitles]).strip()
     text = text[:_MAX_PROMPT_AUDIO_CHARS].strip()
     if not text:
-        raise RuntimeError("flash asr returned empty text")
+        raise RuntimeError(f"SeedASR 返回空文本: request_id={request_id}")
+
+    logger.info("[asr] 转写完成: request_id=%s, 文本长度=%d", request_id, len(text))
     return text, subtitles, duration_ms
 
 
-def _wait_file_active(client, file_id: str) -> None:
-    """Wait until uploaded file becomes active with backoff polling."""
-    max_wait = max(30, int(_FILE_PROCESS_MAX_WAIT_SECONDS))
-    poll = max(5.0, float(_FILE_PROCESS_POLL_INTERVAL_SECONDS))
-    poll_max = max(poll, float(_FILE_PROCESS_MAX_POLL_INTERVAL_SECONDS))
-    start = time.time()
+# ---------------------------------------------------------------------------
+# 单条处理：下载 → 抽音频 → OSS 上传 → ASR 转写
+# ---------------------------------------------------------------------------
 
-    while True:
-        file_obj = client.files.retrieve(file_id)
-        status = str(getattr(file_obj, "status", "") or "").lower()
-        if status == "active":
-            return
-        if status in ("failed", "error", "cancelled"):
-            raise RuntimeError(f"file {file_id} processing failed: status={status}")
-        if time.time() - start >= max_wait:
-            raise RuntimeError(
-                f"Giving up on waiting for file {file_id} to finish processing after {max_wait} seconds."
-            )
-        time.sleep(poll)
-        poll = min(poll_max, poll * 1.5)
+def _oss_key_for(query_id: str, file_basename: str, ext: str) -> str:
+    """生成 OSS 对象 key，与本地 export/media/ 目录结构一致。"""
+    return f"export/media/{query_id}/{file_basename}.{ext}"
 
 
-def transcribe_audio_with_seed2(
-    media_path: Path,
-    *,
-    model: str | None = None,
-    media_kind: str = "audio",
-) -> tuple[str, str, str]:
-    """Upload file via Files API and parse with Responses API.
-
-    Returns (transcript_text, model_api_file_id, input_type).
-    """
-    chosen_model = model or _SEED2_MODEL
-    if not chosen_model:
-        raise RuntimeError("VOLCENGINE_SEEDANCE_MODEL/VOLCENGINE_SEED_MODEL is empty")
-
-    size_mb = media_path.stat().st_size / (1024 * 1024)
-    limit_mb = _MAX_AUDIO_MB if media_kind == "audio" else _MAX_VIDEO_MB
-    if size_mb > limit_mb:
-        raise RuntimeError(
-            f"media too large for single request: {size_mb:.1f}MB > {limit_mb}MB ({media_kind})"
-        )
-
-    input_type = "input_audio" if media_kind == "audio" else "input_video"
-    prompt = (
-        "请完整转录文件中的中文口述内容，输出纯文本，不要解释。如果有口语停顿请自然断句。"
-        if media_kind == "audio"
-        else "请完整转录视频中的中文口述/字幕内容，输出纯文本，不要解释。"
-    )
-
-    client = get_seed2_client(timeout=300)
-    create_kwargs = {"purpose": "user_data"}
-
-    with media_path.open("rb") as f:
-        uploaded = client.files.create(file=f, **create_kwargs)
-    file_id = getattr(uploaded, "id", "")
-    if not file_id:
-        raise RuntimeError("Files API upload succeeded but file.id is empty")
-
-    _wait_file_active(client, file_id)
-
-    req = {
-        "model": chosen_model,
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": input_type,
-                        "file_id": file_id,
-                    },
-                    {"type": "input_text", "text": prompt},
-                ],
-            }
-        ],
-        "caching": {"type": "enabled"},
-        "store": True,
-    }
-    try:
-        resp = client.responses.create(**req)
-    except TypeError:
-        # SDK compatibility: older clients may not accept caching/store args.
-        req.pop("caching", None)
-        req.pop("store", None)
-        resp = client.responses.create(**req)
-    text = _extract_text_from_response(resp)
-    return text[:_MAX_PROMPT_AUDIO_CHARS].strip(), file_id, input_type
+def _file_basename(link_id: str, link_url: str, raw: dict) -> str:
+    """生成音视频文件 basename：link_id + 抖音视频 ID，用于区分同名链接。"""
+    video_id = resolve_video_id(raw, link_url) or extract_video_id_from_url(link_url)
+    if video_id:
+        return f"{link_id}_{video_id}"
+    return link_id
 
 
 def process_one(
@@ -351,7 +256,7 @@ def process_one(
     raw_json: dict | str | None,
     api_base: str = _DEFAULT_API_BASE,
 ) -> dict:
-    """Process one douyin row and return result metadata."""
+    """处理单条抖音链接：下载视频 → 抽取音频 → 上传 OSS → ASR 转写。"""
     raw = _to_raw_dict(raw_json)
     if _has_meaningful_subtitles(raw):
         return {"skipped": True, "reason": "already_has_subtitles"}
@@ -360,84 +265,59 @@ def process_one(
     if not link_url:
         return {"skipped": True, "reason": "missing_link_url"}
 
+    file_basename = _file_basename(link_id, link_url, raw)
     out_dir = _MEDIA_DIR / query_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    video_path = out_dir / f"{link_id}.mp4"
-    audio_path = out_dir / f"{link_id}.mp3"
+    video_path = out_dir / f"{file_basename}.mp4"
+    audio_path = out_dir / f"{file_basename}.mp3"
 
-    # 先下载视频，再抽取 mp3；默认走 ASR 音频转写。
+    # 1) 下载视频
     if not video_path.exists() or video_path.stat().st_size == 0:
         download_video(link_url, api_base, video_path)
 
-    audio_ok = False
-    if audio_path.exists() and audio_path.stat().st_size > 0:
-        audio_ok = True
-    else:
-        try:
-            extract_compress_audio(video_path, audio_path)
-            audio_ok = True
-        except Exception as ext_exc:
-            logger.warning("[audio] %s ffmpeg extract failed, will try Seed2 video: %s", link_id, str(ext_exc)[:200])
+    # 2) 用 ffmpeg 抽取 mp3
+    if not audio_path.exists() or audio_path.stat().st_size == 0:
+        extract_compress_audio(video_path, audio_path)
 
-    transcript_source = "asr_audio"
+    # 3) 上传到 OSS
+    video_oss_url = oss_upload(video_path, _oss_key_for(query_id, file_basename, "mp4"))
+    audio_oss_url = oss_upload(audio_path, _oss_key_for(query_id, file_basename, "mp3"))
+
+    # 4) SeedASR 2.0 转写
     transcript = ""
-    model_api_file_id = ""
-    model_api_input_type = "input_audio"
     subtitles: list[dict] = []
     duration_ms = 0
-    transcript_model = "volcengine_asr_bigmodel"
-    asr_exc: Exception | None = None
+    transcript_source = "seedasr_v2"
+    transcript_model = "seedasr_v2"
 
-    if audio_ok:
-        try:
-            transcript, subtitles, duration_ms = transcribe_with_volcengine_asr(audio_path)
-        except Exception as exc:
-            asr_exc = exc
-            logger.error(
-                "[audio] %s flash asr failed, fallback to seed2 video: %s",
-                link_id,
-                str(exc)[:500],
-                exc_info=True,
-            )
-            audio_ok = False
-
-    if not audio_ok or not transcript:
-        try:
-            transcript, model_api_file_id, model_api_input_type = transcribe_audio_with_seed2(
-                video_path,
-                media_kind="video",
-            )
-            transcript_source = "seed2_video"
-            transcript_model = _safe_transcript_model_name(_SEED2_MODEL)
-        except Exception as seed_exc:
-            err_text = str(seed_exc)
-            logger.error("[audio] %s seed2 video fallback failed: %s", link_id, err_text[:500], exc_info=True)
-            fallback_text = (raw.get("raw_text") or raw.get("caption") or "").strip()
-            if not fallback_text:
-                raise RuntimeError(
-                    f"transcribe failed: asr={asr_exc}; seed2={seed_exc}"
-                ) from seed_exc
-            transcript = fallback_text
-            model_api_file_id = _extract_file_id_from_error(err_text)
-            model_api_input_type = ""
-            transcript_source = "raw_text_fallback"
-            transcript_model = "raw_text_fallback"
-            logger.warning("[audio] %s using raw_text fallback", link_id)
+    try:
+        transcript, subtitles, duration_ms = transcribe_with_seedasr_v2(
+            audio_oss_url, audio_format="mp3",
+        )
+    except Exception as asr_exc:
+        logger.error("[audio] %s SeedASR 转写失败: %s", link_id, str(asr_exc)[:500], exc_info=True)
+        fallback_text = (raw.get("raw_text") or raw.get("caption") or "").strip()
+        if not fallback_text:
+            raise RuntimeError(f"transcribe failed: {asr_exc}") from asr_exc
+        transcript = fallback_text
+        transcript_source = "raw_text_fallback"
+        transcript_model = "raw_text_fallback"
+        logger.warning("[audio] %s 使用 raw_text 回退", link_id)
 
     if not transcript:
         return {
             "skipped": True,
             "reason": "empty_transcript",
-            "audio_path": str(audio_path),
-            "video_path": str(video_path),
+            "audio_path": audio_oss_url,
+            "video_path": video_oss_url,
         }
 
     return {
         "stt_text": transcript,
-        "audio_path": str(audio_path),
-        "video_path": str(video_path),
-        "model_api_file_id": model_api_file_id,
-        "model_api_input_type": model_api_input_type,
+        "audio_path": audio_oss_url,
+        "video_path": video_oss_url,
+        "model_api_file_id": "",
+        "model_api_input_type": "input_audio",
         "transcript_source": transcript_source,
         "transcript_model": transcript_model,
         "subtitles": subtitles,
@@ -446,29 +326,45 @@ def process_one(
     }
 
 
-def _set_video_status(vid: int, link_id: str, status: str, error_message: str = "") -> None:
-    """Update status on qa_link_video (by PK) and qa_link_content.video_parse_status."""
+# ---------------------------------------------------------------------------
+# DB 状态同步（保留原有逻辑）
+# ---------------------------------------------------------------------------
+
+def _set_video_status(
+    vid: int, link_id: str, status: str, error_message: str = "",
+    video_updated_at=None, content_updated_at=None,
+) -> None:
+    """更新 qa_link_video 和 qa_link_content.video_parse_status 的状态。"""
     extra = ""
     params: list = [status, vid]
     if error_message:
         extra = ", error_message = %s, retry_count = retry_count + 1"
         params = [status, error_message, vid]
-    execute(
-        f"UPDATE qa_link_video SET status = %s{extra} WHERE id = %s",
-        tuple(params),
+    ol_v = " AND updated_at = %s" if video_updated_at else ""
+    params_v = tuple(params) + (video_updated_at,) if video_updated_at else tuple(params)
+    n = execute(
+        f"UPDATE qa_link_video SET status = %s{extra} WHERE id = %s{ol_v}",
+        params_v,
     )
-    execute(
-        "UPDATE qa_link_content SET video_parse_status = %s WHERE link_id = %s",
-        (status, link_id),
+    if video_updated_at and n == 0:
+        logger.warning("[audio] qa_link_video id=%s optimistic lock failed", vid)
+    ol_c = " AND updated_at = %s" if content_updated_at else ""
+    params_c = (status, link_id, content_updated_at) if content_updated_at else (status, link_id)
+    n = execute(
+        f"UPDATE qa_link_content SET video_parse_status = %s WHERE link_id = %s{ol_c}",
+        params_c,
     )
+    if content_updated_at and n == 0:
+        logger.warning("[audio] qa_link_content %s optimistic lock failed", link_id)
 
 
-def _sync_to_content(vid: int, link_id: str, result: dict, raw: dict) -> None:
-    """Write STT results back into qa_link_content.raw_json (by link_id)
-    and qa_link_video (by PK vid), then clear content_json for re-structuring.
-    """
+def _sync_to_content(
+    vid: int, link_id: str, result: dict, raw: dict,
+    video_updated_at=None, content_updated_at=None,
+) -> None:
+    """将 STT 结果写回 qa_link_content.raw_json 和 qa_link_video，并清空 content_json 以便重新结构化。"""
     stt_text = (result.get("stt_text") or "").strip()
-    model_name = (result.get("transcript_model") or _safe_transcript_model_name(_SEED2_MODEL)).strip()
+    model_name = (result.get("transcript_model") or "seedasr_v2").strip()
     subtitles = result.get("subtitles")
     if not isinstance(subtitles, list):
         subtitles = []
@@ -478,7 +374,7 @@ def _sync_to_content(vid: int, link_id: str, result: dict, raw: dict) -> None:
     raw["audio_info"]["audio_path"] = result.get("audio_path", "")
     raw["audio_info"]["video_path"] = result.get("video_path", "")
     raw["audio_info"]["transcript_model"] = model_name
-    raw["audio_info"]["transcript_source"] = result.get("transcript_source", "audio_input")
+    raw["audio_info"]["transcript_source"] = result.get("transcript_source", "seedasr_v2")
     raw["audio_info"]["model_api_file_id"] = result.get("model_api_file_id", "")
     raw["audio_info"]["model_api_input_type"] = result.get("model_api_input_type", "")
     if result.get("duration_ms"):
@@ -489,32 +385,40 @@ def _sync_to_content(vid: int, link_id: str, result: dict, raw: dict) -> None:
     elif not _has_meaningful_subtitles(raw):
         raw["subtitles"] = [{"start_time": "", "text": stt_text}]
 
-    execute(
+    ol_c = " AND updated_at = %s" if content_updated_at else ""
+    params_c = (json.dumps(raw, ensure_ascii=False), link_id, content_updated_at) if content_updated_at else (json.dumps(raw, ensure_ascii=False), link_id)
+    n = execute(
         "UPDATE qa_link_content "
         "SET raw_json = %s, content_json = NULL, status = 'done', video_parse_status = 'done' "
-        "WHERE link_id = %s",
-        (json.dumps(raw, ensure_ascii=False), link_id),
+        f"WHERE link_id = %s{ol_c}",
+        params_c,
     )
+    if content_updated_at and n == 0:
+        logger.warning("[audio] qa_link_content %s optimistic lock failed (sync)", link_id)
 
-    execute(
+    ol_v = " AND updated_at = %s" if video_updated_at else ""
+    base = (
+        stt_text, result.get("video_path", ""), result.get("audio_path", ""),
+        model_name, result.get("transcript_source", ""), result.get("model_api_file_id", ""),
+        json.dumps(raw.get("subtitles") or [], ensure_ascii=False), vid,
+    )
+    params_v = base + (video_updated_at,) if video_updated_at else base
+    n = execute(
         "UPDATE qa_link_video SET "
         "stt_text = %s, video_path = %s, audio_path = %s, "
         "transcript_model = %s, transcript_source = %s, "
         "model_api_file_id = %s, subtitles = %s, "
         "status = 'done', transcribed_at = CURRENT_TIMESTAMP "
-        "WHERE id = %s",
-        (
-            stt_text,
-            result.get("video_path", ""),
-            result.get("audio_path", ""),
-            model_name,
-            result.get("transcript_source", ""),
-            result.get("model_api_file_id", ""),
-            json.dumps(raw.get("subtitles") or [], ensure_ascii=False),
-            vid,
-        ),
+        f"WHERE id = %s{ol_v}",
+        params_v,
     )
+    if video_updated_at and n == 0:
+        logger.warning("[audio] qa_link_video id=%s optimistic lock failed (sync)", vid)
 
+
+# ---------------------------------------------------------------------------
+# 批量处理
+# ---------------------------------------------------------------------------
 
 def batch_process(
     *,
@@ -523,11 +427,9 @@ def batch_process(
     concurrency: int = 2,
     batch_size: int = 1000,
 ) -> int:
-    """Claim one batch from qa_link_video, process, and sync results to qa_link_content."""
-    rows = fetch_all(
-        "SELECT * FROM claim_pending_video_parse_v2(%s, %s)",
-        (max(1, int(batch_size)), query_ids or None),
-    )
+    """从 qa_link_video 领取一批待处理行，执行完整的转写流程并同步到 qa_link_content。"""
+    from shared.claim_functions import claim_pending_video_parse_v2
+    rows = claim_pending_video_parse_v2(max(1, int(batch_size)), query_ids=query_ids or None)
 
     if not rows:
         logger.info("[audio] no eligible douyin links for transcription")
@@ -535,7 +437,7 @@ def batch_process(
 
     success_count = 0
 
-    def _run(row: dict) -> tuple[int, str, dict, dict]:
+    def _run(row: dict) -> tuple[int, str, dict, dict, dict]:
         vid = row["vid"]
         link_id = row["link_id"]
         try:
@@ -552,39 +454,40 @@ def batch_process(
                 "skipped": True,
                 "reason": f"error:{exc}",
             }
-        return vid, link_id, _to_raw_dict(row.get("raw_json")), result
+        return vid, link_id, _to_raw_dict(row.get("raw_json")), result, row
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
         futures = [ex.submit(_run, row) for row in rows]
         for fut in as_completed(futures):
-            vid, link_id, raw, result = fut.result()
+            vid, link_id, raw, result, row = fut.result()
+            vo, co = row.get("video_updated_at"), row.get("content_updated_at")
             if result.get("skipped"):
                 reason = result.get("reason", "")
                 if reason == "already_has_subtitles":
-                    _set_video_status(vid, link_id, "skip")
+                    _set_video_status(vid, link_id, "skip", video_updated_at=vo, content_updated_at=co)
                     execute(
                         "UPDATE qa_link_video SET subtitles = %s WHERE id = %s",
                         (json.dumps(raw.get("subtitles") or [], ensure_ascii=False), vid),
                     )
                 elif reason == "already_has_stt_text":
-                    _set_video_status(vid, link_id, "done")
+                    _set_video_status(vid, link_id, "done", video_updated_at=vo, content_updated_at=co)
                     execute(
                         "UPDATE qa_link_video SET stt_text = %s WHERE id = %s",
                         (raw.get("stt_text", ""), vid),
                     )
                 else:
                     err_msg = str(reason)[:500]
-                    _set_video_status(vid, link_id, "error", err_msg)
+                    _set_video_status(vid, link_id, "error", err_msg, video_updated_at=vo, content_updated_at=co)
                 logger.info("[audio] skip %s: %s", link_id, reason)
                 continue
 
             stt_text = (result.get("stt_text") or "").strip()
             if not stt_text:
-                _set_video_status(vid, link_id, "error", "empty_transcript")
+                _set_video_status(vid, link_id, "error", "empty_transcript", video_updated_at=vo, content_updated_at=co)
                 logger.info("[audio] skip %s: empty stt_text", link_id)
                 continue
 
-            _sync_to_content(vid, link_id, result, raw)
+            _sync_to_content(vid, link_id, result, raw, video_updated_at=vo, content_updated_at=co)
 
             execute(
                 "UPDATE qa_link_video SET fetched_at = CURRENT_TIMESTAMP "
@@ -595,4 +498,3 @@ def batch_process(
             logger.info("[audio] transcribed %s", link_id)
 
     return success_count
-

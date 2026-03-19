@@ -12,6 +12,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared.db import fetch_all, execute
+from shared.sql_builder import sb
 
 # 匹配 export/Q0001/ 形式，替换为 export/media/Q0001/
 _PATTERN = re.compile(r"export/Q(\d+)/")
@@ -50,12 +51,13 @@ def migrate_qa_link_video() -> int:
 
 def migrate_qa_link_content() -> int:
     """更新 qa_link_content.raw_json 中的 audio_info.video_path、audio_info.audio_path。"""
+    _has_key = sb.json_key_exists("raw_json", "audio_info")
     rows = fetch_all(
-        "SELECT link_id, raw_json FROM qa_link_content WHERE raw_json ? 'audio_info'"
+        f"SELECT link_id, raw_json FROM qa_link_content WHERE {_has_key}"
     )
     count = 0
     for r in rows:
-        raw = dict(r["raw_json"])
+        raw = r["raw_json"] if isinstance(r["raw_json"], dict) else json.loads(r["raw_json"])
         ai = raw.get("audio_info") or {}
         vp_old, ap_old = ai.get("video_path"), ai.get("audio_path")
         vp = _fix_path(vp_old)

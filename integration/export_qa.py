@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from shared.db import fetch_all, fetch_one
+from shared.sql_builder import sb
 
 _EXPORT_DIR = Path(__file__).resolve().parent.parent / "export"
 
@@ -27,7 +28,7 @@ def _query_stats():
     )["c"]
     answers = fetch_one("SELECT COUNT(*) AS c FROM qa_answer", ())["c"]
     avg_len = fetch_one(
-        "SELECT COALESCE(AVG(answer_length), 0)::INT AS c FROM qa_answer", ()
+        f"SELECT {sb.cast_int('COALESCE(AVG(answer_length), 0)')} AS c FROM qa_answer", ()
     )["c"]
     links_total = fetch_one("SELECT COUNT(*) AS c FROM qa_link", ())["c"]
     links_done = fetch_one(

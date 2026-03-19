@@ -71,20 +71,28 @@ def _probe_tcp(host: str, port: int, timeout_sec: float = 0.8) -> bool:
 
 
 def _check_postgres_or_hint() -> bool:
-    """Check PostgreSQL early, print actionable hints on failure."""
+    """Check database connectivity early, print actionable hints on failure."""
     from shared.db import get_connection
+    from shared.config import CONFIG
 
+    db_type = CONFIG["db_type"]
     try:
         conn = get_connection()
         conn.close()
         return True
     except Exception as exc:  # pragma: no cover - runtime guard
-        print("[依赖检查] PostgreSQL 未就绪，无法继续执行。")
+        print(f"[依赖检查] {db_type} 数据库未就绪，无法继续执行。")
         print(f"[依赖检查] 错误: {exc}")
-        print("[依赖检查] 先启动数据库后重试：")
-        print("  - macOS: brew services start postgresql@17  (或 postgresql)")
-        print("  - Linux: sudo systemctl start postgresql")
-        print("[依赖检查] 同时请确认 .env 里的 PGHOST/PGPORT/PGUSER/PGPASSWORD。")
+        if db_type == "postgresql":
+            print("[依赖检查] 先启动数据库后重试：")
+            print("  - macOS: brew services start postgresql@17  (或 postgresql)")
+            print("  - Linux: sudo systemctl start postgresql")
+            print("[依赖检查] 同时请确认 .env 里的 PGHOST/PGPORT/PGUSER/PGPASSWORD。")
+        else:
+            print("[依赖检查] 先启动数据库后重试：")
+            print("  - macOS: brew services start mysql")
+            print("  - Linux: sudo systemctl start mysql")
+            print("[依赖检查] 同时请确认 .env 里的 MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD。")
         return False
 
 
@@ -354,23 +362,35 @@ def _select_query_ids_in_range(
 def _range_status_snapshot(start_query_id: str, end_query_id: str) -> dict:
     """Return status counters for the selected query_id range."""
     from shared.db import fetch_one
+    from shared.sql_builder import sb
+
+    cf = sb.count_filter
+    q_pending = cf("status = 'pending'")
+    q_processing = cf("status = 'processing'")
+    q_done = cf("status = 'done'")
+    q_error = cf("status = 'error'")
 
     q = fetch_one(
-        "SELECT "
-        "COUNT(*) FILTER (WHERE status = 'pending') AS pending, "
-        "COUNT(*) FILTER (WHERE status = 'processing') AS processing, "
-        "COUNT(*) FILTER (WHERE status = 'done') AS done, "
-        "COUNT(*) FILTER (WHERE status = 'error') AS error "
-        "FROM qa_query WHERE query_id >= %s AND query_id <= %s",
+        f"SELECT "
+        f"{q_pending} AS pending, "
+        f"{q_processing} AS processing, "
+        f"{q_done} AS done, "
+        f"{q_error} AS error "
+        f"FROM qa_query WHERE query_id >= %s AND query_id <= %s",
         (start_query_id, end_query_id),
     ) or {}
 
+    l_pending = cf("l.status = 'pending'")
+    l_processing = cf("l.status = 'processing'")
+    l_done = cf("l.status = 'done'")
+    l_error = cf("l.status = 'error'")
+
     l = fetch_one(
-        "SELECT "
-        "COUNT(*) FILTER (WHERE l.status = 'pending') AS pending, "
-        "COUNT(*) FILTER (WHERE l.status = 'processing') AS processing, "
-        "COUNT(*) FILTER (WHERE l.status = 'done') AS done, "
-        "COUNT(*) FILTER (WHERE l.status = 'error') AS error "
+        f"SELECT "
+        f"{l_pending} AS pending, "
+        f"{l_processing} AS processing, "
+        f"{l_done} AS done, "
+        f"{l_error} AS error "
         "FROM qa_link l "
         "WHERE EXISTS ("
         "  SELECT 1 FROM qa_query q "
@@ -379,12 +399,17 @@ def _range_status_snapshot(start_query_id: str, end_query_id: str) -> dict:
         (start_query_id, end_query_id),
     ) or {}
 
+    v_pending = cf("v.status = 'pending'")
+    v_processing = cf("v.status = 'processing'")
+    v_done = cf("v.status IN ('done','skip')")
+    v_error = cf("v.status = 'error'")
+
     v = fetch_one(
-        "SELECT "
-        "COUNT(*) FILTER (WHERE v.status = 'pending') AS pending, "
-        "COUNT(*) FILTER (WHERE v.status = 'processing') AS processing, "
-        "COUNT(*) FILTER (WHERE v.status IN ('done','skip')) AS done, "
-        "COUNT(*) FILTER (WHERE v.status = 'error') AS error "
+        f"SELECT "
+        f"{v_pending} AS pending, "
+        f"{v_processing} AS processing, "
+        f"{v_done} AS done, "
+        f"{v_error} AS error "
         "FROM qa_link_video v "
         "JOIN qa_link lnk ON lnk.link_id = v.link_id "
         "WHERE EXISTS ("
