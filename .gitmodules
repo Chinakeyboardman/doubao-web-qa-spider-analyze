@@ -2,7 +2,9 @@
 	path = douyin-crawler
 	url = git@github.com:Chinakeyboardman/douyin-crawler.git
 	branch = master
+	ignore = untracked
 [submodule "Douyin_TikTok_Download_API"]
 	path = Douyin_TikTok_Download_API
 	url = git@github.com:Evil0ctal/Douyin_TikTok_Download_API.git
 	branch = main
+	ignore = untracked
