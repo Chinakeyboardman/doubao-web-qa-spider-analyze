@@ -177,7 +177,19 @@ title: 'PIPELINE_DEV_DOC'
 | XiaohongshuCrawler | `web-crawler/crawlers/xiaohongshu.py` | httpx + BS4 | 直接 HTTP + SSR JSON | 3 次指数退避 |
 | GenericWebCrawler | `web-crawler/crawlers/generic_web.py` | httpx + BS4 | 直接 HTTP + HTML 解析 | 3 次指数退避 |
 
-### 3.4 抖音爬虫 URL 规范化
+### 3.4 入库前压缩（评论 Top20、超长正文）
+
+在 `web-crawler/crawler_manager.py` 写入 `qa_link_content` 前调用 `integration/raw_content_postprocess.postprocess_raw_for_storage`：
+
+| 项目 | 说明 |
+|------|------|
+| 评论 | 按点赞（`digg_count` 等）降序，最多 **20** 条；抖音 API 与 `douyin_comments` DB 回退一致 |
+| 超长正文 | `raw_text` / `paragraphs` 估计长度 ≥ **12 万字符** 时，用火山 **seed 模型** 去掉导航、页脚、按钮、广告等噪声，只保留主题正文；LLM 失败则硬截断 |
+| 存储 | 整份 `raw_json` 约 **6MB（UTF-8 字节）** 硬上限，降低 MySQL `max_allowed_packet` 与迁移脚本风险 |
+
+**排错**：`output/error.log` 只收录 **ERROR**；近期多为 **抖音音频/ffmpeg**、通用爬取失败。**Step 3 结构化** 若失败，常见日志在终端或 `output/run_sync_*.log`，不一定写入 `error.log`。
+
+### 3.5 抖音爬虫 URL 规范化
 
 抖音链接格式多样，爬虫内部会自动规范化：
 
@@ -189,7 +201,7 @@ https://www.douyin.com/video/12345               → [原URL]
 https://v.douyin.com/xxxx                        → [原URL, 尝试解析 video_id]
 ```
 
-### 3.5 质量保护机制
+### 3.6 质量保护机制
 
 爬虫在写入 `qa_link_content` 时，会做质量评分保护：
 
@@ -200,7 +212,7 @@ https://v.douyin.com/xxxx                        → [原URL, 尝试解析 video
           → 跳过写入，保留旧数据
 ```
 
-### 3.6 日志案例
+### 3.7 日志案例
 
 ```
 03:57:38 INFO  crawler_manager Crawling [抖音] Q0001_L001: https://www.douyin.com/video/7614484602547942257
@@ -213,7 +225,7 @@ https://v.douyin.com/xxxx                        → [原URL, 尝试解析 video
 03:57:45 INFO  crawler_manager Batch crawl done: 3 / 5 succeeded
 ```
 
-### 3.7 数据流
+### 3.8 数据流
 
 ```
 输入: qa_link (status='pending')
@@ -244,7 +256,7 @@ https://v.douyin.com/xxxx                        → [原URL, 尝试解析 video
       └──────────────────────────────────────────┘
 ```
 
-### 3.8 时间预估
+### 3.9 时间预估
 
 > **2026-03 起**：路由与 httpx 超时、抖音 400 快速失败、域名识别等已优化，**单条 link 常见路径**较此前 **约降 30%~50%**。
 

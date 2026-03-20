@@ -211,7 +211,14 @@ class DouyinVideoCrawler(BaseCrawler):
             except Exception as exc:
                 logger.debug("Fetch comments page error: %s", exc)
                 break
-        return all_comments
+        # 只保留点赞最高的 20 条（与入库前 postprocess 一致，减少噪声与体积）
+        try:
+            from integration.raw_content_postprocess import top_comments_by_engagement
+
+            return top_comments_by_engagement(all_comments, max_n=20)
+        except Exception:
+            all_comments.sort(key=lambda c: int(c.get("digg_count") or 0), reverse=True)
+            return all_comments[:20]
 
     @staticmethod
     async def _resolve_aweme_id(api_base: str, url: str) -> str:
@@ -247,7 +254,7 @@ class DouyinVideoCrawler(BaseCrawler):
 
             comments_rows = fetch_all(
                 "SELECT username, content, time, location, likes "
-                "FROM douyin_comments WHERE video_id = %s ORDER BY likes DESC",
+                "FROM douyin_comments WHERE video_id = %s ORDER BY likes DESC LIMIT 20",
                 (video_id,),
             )
 

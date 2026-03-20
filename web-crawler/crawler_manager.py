@@ -22,6 +22,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from shared.db import execute, fetch_all
 from shared.sql_builder import sb
 from integration.parsing_routing import should_crawl_content
+from integration.raw_content_postprocess import postprocess_raw_for_storage
 from crawlers.base import BaseCrawler
 from crawlers.generic_web import GenericWebCrawler
 from crawlers.douyin_video import DouyinVideoCrawler
@@ -99,6 +100,10 @@ class CrawlerManager:
             try:
                 async with sem:
                     raw_content = await self.crawl_link(row)
+                # 评论 Top20、超长正文 LLM 去噪、JSON 字节上限（integration/raw_content_postprocess.py）
+                raw_content = await asyncio.to_thread(
+                    postprocess_raw_for_storage, raw_content, link_id
+                )
                 self._save_raw_content(link_id, raw_content)
 
                 link_updated_at = row.get("updated_at")
