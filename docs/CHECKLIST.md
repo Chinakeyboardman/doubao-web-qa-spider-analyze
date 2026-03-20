@@ -243,6 +243,7 @@ doubao-web-qa-spider-analyze/
 - [x] GitHub Pages：`docs/` 增加 Jekyll（`_config.yml`、`index.md`、`Gemfile`、各文档 YAML 头），`docs/README.md` / 根 `README.md` 写明启用方式；站点 <https://chinakeyboardman.github.io/doubao-web-qa-spider-analyze/>
 - [x] 开源与合规：根目录 `LICENSE`（MIT）、`docs/DISCLAIMER.md`（学习/测试用途、法律与平台责任声明）；根 `README.md` / `docs/README.md` / `docs/index.md` 链出声明
 - [x] `run-sync` crawl worker：由「区间内按 qa_query.id 取前 N 个 query」改为「区间内仍有 `qa_link.status=pending` 的 query」（`_select_query_ids_with_pending_links`），避免大区间内后半段 pending link 长期轮不到、crawl/link_contents 不涨
+- [x] `run-sync --skip-collect`：区间内 query 已全部 done 时只跑 crawl/enrich/audio/structure；续跑说明见 `CLI_COMMANDS.md`（`--start`/`--end` 与 `--limit` 区别）
 
 #### 4.9 平台识别修复 + 空内容数据修复 ✅
 

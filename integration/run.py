@@ -516,7 +516,12 @@ def cmd_run_sync(args):
 
     _setup_run_sync_logging(log_file)
     logger = logging.getLogger(__name__)
+    skip_collect = getattr(args, "skip_collect", False)
     logger.info("run-sync started: %s ~ %s, log=%s", start_id, end_id, log_file)
+    if skip_collect:
+        logger.info(
+            "run-sync: --skip-collect enabled (不启动 collect；区间内仅 crawl/enrich/audio/structure 消费 backlog)"
+        )
 
     async def _collect_worker():
         if use_web:
@@ -715,14 +720,22 @@ def cmd_run_sync(args):
             await pipeline.collector.stop()
 
     async def _run():
-        await _pre_check_login()
-        tasks = [
-            asyncio.create_task(_collect_worker(), name="collect_worker"),
-            asyncio.create_task(_crawl_worker(), name="crawl_worker"),
-            asyncio.create_task(_enrich_worker(), name="enrich_worker"),
-            asyncio.create_task(_audio_worker(), name="audio_worker"),
-            asyncio.create_task(_structure_worker(), name="structure_worker"),
-        ]
+        if not skip_collect:
+            await _pre_check_login()
+        elif use_web:
+            logger.info("run-sync: 已跳过豆包登录预检查（--skip-collect，无需浏览器采集）")
+
+        tasks = []
+        if not skip_collect:
+            tasks.append(asyncio.create_task(_collect_worker(), name="collect_worker"))
+        tasks.extend(
+            [
+                asyncio.create_task(_crawl_worker(), name="crawl_worker"),
+                asyncio.create_task(_enrich_worker(), name="enrich_worker"),
+                asyncio.create_task(_audio_worker(), name="audio_worker"),
+                asyncio.create_task(_structure_worker(), name="structure_worker"),
+            ]
+        )
         monitor_task = asyncio.create_task(_monitor_and_stop(tasks), name="monitor")
         try:
             await monitor_task
@@ -963,6 +976,11 @@ def main():
     p_run_sync.add_argument(
         "--log-file",
         help="日志文件路径（默认 output/run_sync_{start}_{end}_{时间戳}.log）",
+    )
+    p_run_sync.add_argument(
+        "--skip-collect",
+        action="store_true",
+        help="不跑 collect：区间内仅 crawl/enrich/audio/structure（适合 query 已全部 done、只补链路时；不会重采豆包）",
     )
     p_run_sync.set_defaults(func=cmd_run_sync)
 

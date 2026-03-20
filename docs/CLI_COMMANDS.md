@@ -97,12 +97,21 @@ cd Douyin_TikTok_Download_API && python start.py
 
 ### 1.3 异步批量（run-sync）
 
+**续跑同一区间、不重采已 done 的 query**
+
+- 用 **`--start-query-id` + `--end-query-id`**（与上次日志里 `run-sync started: A ~ B` 一致），不要用 **`--limit`**（limit 会按当前 pending 重新算 min/max，区间可能变）。
+- **collect** 只会处理区间内 **`qa_query.status = pending`** 的行，**不会**对已 `done` 的 query 再采豆包。
+- 若区间内 **query 已全部 done**，只剩 link/crawl/转写/结构化未完成：加 **`--skip-collect`**，避免起浏览器、只跑 crawl/enrich/audio/structure。
+
 ```bash
 # 按数量：取前 20 条 pending 跑批（推荐）
 ./venv/bin/python integration/run.py run-sync --limit 20
 
-# 按范围：指定 query_id 区间
-./venv/bin/python integration/run.py run-sync --start-query-id Q0001 --end-query-id Q0020
+# 按范围：指定 query_id 区间（与上次 run_sync 日志中的 A ~ B 对齐即可续跑）
+./venv/bin/python integration/run.py run-sync --start-query-id Q0245 --end-query-id Q0319
+
+# 区间内 query 已全部采集完，只补 crawl / 抖音 / 结构化（不重跑 collect）
+./venv/bin/python integration/run.py run-sync --start-query-id Q0245 --end-query-id Q0319 --skip-collect
 
 # 指定日志路径
 ./venv/bin/python integration/run.py run-sync --limit 20 --log-file output/my_run.log
