@@ -376,6 +376,34 @@ def _select_query_ids_in_range(
     return [r["query_id"] for r in rows]
 
 
+def _select_query_ids_with_pending_links(
+    *,
+    start_query_id: str,
+    end_query_id: str,
+    limit: int,
+) -> list[str]:
+    """在 [start_query_id, end_query_id] 内，选出「至少有一条 pending 的 qa_link」的 query_id。
+
+    说明：若仅用 `_select_query_ids_in_range(..., limit=N)`（按 qa_query.id 取前 N 个 query），
+    当区间内行数很多时，前 N 个 query 可能已全部 crawl 完（无 pending），而后半段 query
+    上仍有大量 pending link，则 crawl 会一直空转，出现「collect/query done 增加很多，
+    但 links.done、link_contents 几乎不涨」的现象。
+    """
+    from shared.db import fetch_all
+
+    rows = fetch_all(
+        "SELECT t.query_id FROM ("
+        "  SELECT query_id, MIN(id) AS mid FROM qa_link "
+        "  WHERE query_id >= %s AND query_id <= %s AND status = 'pending' "
+        "  GROUP BY query_id"
+        ") t "
+        "ORDER BY t.mid "
+        "LIMIT %s",
+        (start_query_id, end_query_id, int(limit)),
+    )
+    return [r["query_id"] for r in rows]
+
+
 def _range_status_snapshot(start_query_id: str, end_query_id: str) -> dict:
     """Return status counters for the selected query_id range."""
     from shared.db import fetch_one
@@ -537,7 +565,7 @@ def cmd_run_sync(args):
     async def _crawl_worker():
         idle_sleep = 1
         while True:
-            qids = _select_query_ids_in_range(
+            qids = _select_query_ids_with_pending_links(
                 start_query_id=start_id,
                 end_query_id=end_id,
                 limit=args.crawl_query_window,

@@ -242,6 +242,7 @@ doubao-web-qa-spider-analyze/
 - [x] docs 目录清理：移除过期 `douyin-crawler-worker-README.md`、`douyin-crawler-CLAUDE.md`，新增 `docs/README.md` 导航
 - [x] GitHub Pages：`docs/` 增加 Jekyll（`_config.yml`、`index.md`、`Gemfile`、各文档 YAML 头），`docs/README.md` / 根 `README.md` 写明启用方式；站点 <https://chinakeyboardman.github.io/doubao-web-qa-spider-analyze/>
 - [x] 开源与合规：根目录 `LICENSE`（MIT）、`docs/DISCLAIMER.md`（学习/测试用途、法律与平台责任声明）；根 `README.md` / `docs/README.md` / `docs/index.md` 链出声明
+- [x] `run-sync` crawl worker：由「区间内按 qa_query.id 取前 N 个 query」改为「区间内仍有 `qa_link.status=pending` 的 query」（`_select_query_ids_with_pending_links`），避免大区间内后半段 pending link 长期轮不到、crawl/link_contents 不涨
 
 #### 4.9 平台识别修复 + 空内容数据修复 ✅
 

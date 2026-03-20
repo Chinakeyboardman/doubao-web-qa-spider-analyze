@@ -116,6 +116,8 @@ cd Douyin_TikTok_Download_API && python start.py
 
 **日志**：默认写入 `output/run_sync_{start}_{end}_{时间戳}.log`
 
+**crawl 选 query 窗口**：`--crawl-query-window`（默认 100）在 `[min,max]` 区间内优先选择**仍含有 `qa_link.status=pending`** 的 `query_id`（按最早 pending link 排序），避免区间内 query 很多时「永远只扫 id 最前的一段、后半段 link 长期不爬」导致 `links.done` / `qa_link_content` 几乎不涨。
+
 **登录/人机验证**：run-sync 启动前会做登录预检查，失败则直接退出。若采集时频繁超时或失败，建议：
 1. 先执行 `web-login --manual` 完成登录/验证
 2. 或使用 `--headed` 显示浏览器窗口，便于人工处理验证码
@@ -129,6 +131,7 @@ cd Douyin_TikTok_Download_API && python start.py
 | `--collect-batch-size` | collect 单批（串行建议） | 1 |
 | `--crawl-batch-size` | crawl 单批 | 50 |
 | `--crawl-concurrency` | crawl 并发 | 3 |
+| `--crawl-query-window` | 每轮参与 crawl 的 query 数（有 pending link 的优先） | 100 |
 | `--structure-concurrency` | structure LLM 并发 | 5 |
 
 ### 1.4 持续跑批（run-until）
