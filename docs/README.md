@@ -1,5 +1,10 @@
 # docs 导航
 
+## 许可与免责声明
+
+- **开源许可证**：仓库根目录 [`LICENSE`](../LICENSE)（MIT）。
+- **免责声明（爬虫/采集场景必读）**：[`DISCLAIMER.md`](DISCLAIMER.md)（学习测试用途、合规义务、无担保与责任限制）。
+
 ## GitHub Pages 文档站
 
 仓库 **Settings → Pages** 中：**Build and deployment → Branch `main`，Folder `/docs`**，保存后即可在线浏览：

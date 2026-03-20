@@ -2,6 +2,8 @@
 
 豆包 Web 端 QA 数据采集与分析系统。通过多个子项目协作，完成「Query 输入 → 豆包爬取 → 引用链接抓取 → 视频下载 → 数据清洗入库」的全流程。
 
+> **⚠️ 使用声明**：本项目**仅供个人学习、技术研究与合法环境下的本地测试**。使用者须自行遵守法律法规、目标网站服务条款与 `robots.txt` 等规则；**禁止**用于未经授权的大规模抓取或侵权用途。完整说明见 **[docs/DISCLAIMER.md](docs/DISCLAIMER.md)**。软件按 [MIT License](LICENSE) 授权，**按原样提供、无担保**。
+
 ## 目录结构
 
 ```
@@ -17,7 +19,8 @@
 ├── data-clean/                 # 数据清洗（格式 A/B/C/D 结构化）
 ├── integration/                # 业务对接层（调用开源项目，不侵入其源码）
 ├── shared/                     # 共享配置与工具
-├── docs/                       # 项目文档
+├── LICENSE                     # MIT 开源许可证
+├── docs/                       # 项目文档（含免责声明 DISCLAIMER.md）
 │   ├── CHECKLIST.md            # 项目 Checklist
 │   ├── PIPELINE_DEV_DOC.md     # Pipeline 开发文档
 │   ├── PARSING_ROUTING.md      # 爬虫平台路由说明
@@ -136,6 +139,16 @@ python import_queries.py
 - **方案设计.md**：子项目设计与 Langchain/火山云选型
 - **PARSING_ROUTING.md**：爬虫平台路由规则
 - **docs/README.md**：文档导航（建议先读）
+
+## 许可与免责声明
+
+| 项目 | 说明 |
+|------|------|
+| **开源许可** | 本仓库原创代码以 **[MIT License](LICENSE)** 发布。 |
+| **免责声明** | **[docs/DISCLAIMER.md](docs/DISCLAIMER.md)**：学习/测试用途、合规义务、责任限制（**使用前请完整阅读**）。 |
+| **第三方子项目** | `douyin-crawler/`、`Douyin_TikTok_Download_API/` 等保留各自原有许可证，使用须同时遵守。 |
+
+*本说明不构成法律意见。*
 
 ## 开源项目保护原则
 

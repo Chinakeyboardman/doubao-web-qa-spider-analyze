@@ -6,6 +6,8 @@ permalink: /
 
 # docs 导航
 
+> **许可与合规**：本项目以 [MIT](https://github.com/Chinakeyboardman/doubao-web-qa-spider-analyze/blob/main/LICENSE) 授权；**使用声明、法律规避与责任限制**见 [**免责声明与合规提示**]({% link DISCLAIMER.md %})。
+
 为减少重复文档和过期说明，`docs/` 按「日常运行优先」组织如下：
 
 ## 1) 先看这三份
