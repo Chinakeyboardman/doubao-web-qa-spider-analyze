@@ -1,3 +1,8 @@
+---
+layout: default
+title: 'DOUYIN_API_SETUP'
+---
+
 # 抖音视频下载 API 运行指南
 
 > 与主项目 Python 版本隔离，避免环境混乱

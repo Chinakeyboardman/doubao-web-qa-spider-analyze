@@ -1,3 +1,8 @@
+---
+layout: default
+title: '大规模qa数据获取'
+---
+
 一、数据收集的层级结构
 每次Query收集3个层级的数据：
 Level 1: 豆包回答本身

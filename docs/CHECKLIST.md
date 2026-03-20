@@ -1,3 +1,8 @@
+---
+layout: default
+title: 'CHECKLIST'
+---
+
 # 项目 Checklist
 
 ## 一、架构决策（已确定）
@@ -235,6 +240,7 @@ doubao-web-qa-spider-analyze/
 - [x] CLI 启动预检：`run.py` 增加 PostgreSQL/抖音下载 API 自动提示（依赖未就绪时 fail-fast 或 warn）
 - [x] 文档更新：`CLI_COMMANDS.md` 补充 audio/link-ids/5表导出与依赖预检说明；`PIPELINE_DEV_DOC.md` 补齐 Step2.6 与最新耗时区间（2026-03-20：Collect/Crawl/Audio/Structure 各节与 §11 已按优化后观测再修订）
 - [x] docs 目录清理：移除过期 `douyin-crawler-worker-README.md`、`douyin-crawler-CLAUDE.md`，新增 `docs/README.md` 导航
+- [x] GitHub Pages：`docs/` 增加 Jekyll（`_config.yml`、`index.md`、`Gemfile`、各文档 YAML 头），`docs/README.md` / 根 `README.md` 写明启用方式；站点 <https://chinakeyboardman.github.io/doubao-web-qa-spider-analyze/>
 
 #### 4.9 平台识别修复 + 空内容数据修复 ✅
 

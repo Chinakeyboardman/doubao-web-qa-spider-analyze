@@ -1,0 +1,17 @@
+# GitHub Pages（从仓库 /docs 目录发布）
+# 仓库 Settings → Pages → Branch: main, Folder: /docs
+title: doubao-web-qa-spider-analyze 文档
+description: 豆包 QA Pipeline 与集成说明
+theme: jekyll-theme-cayman
+
+url: https://chinakeyboardman.github.io
+baseurl: /doubao-web-qa-spider-analyze
+
+markdown: kramdown
+highlighter: rouge
+
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - vendor

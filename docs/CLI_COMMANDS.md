@@ -1,3 +1,8 @@
+---
+layout: default
+title: 'CLI_COMMANDS'
+---
+
 # 脚本命令速查
 
 > 所有命令均在项目根目录执行，使用 `./venv/bin/python` 或激活 venv 后 `python`。

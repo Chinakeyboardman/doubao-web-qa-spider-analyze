@@ -1,3 +1,8 @@
+---
+layout: default
+title: 'PARSING_ROUTING'
+---
+
 # 链接解析方式路由说明
 
 对 **qa_link** 中的链接进行**爬虫、收集内容、入库到 qa_link_content** 时，根据**网站特征**（由 `integration/citation_parser.identify_platform` 识别）走不同解析方式。

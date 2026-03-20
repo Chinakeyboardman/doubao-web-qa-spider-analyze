@@ -1,3 +1,8 @@
+---
+layout: default
+title: 'PIPELINE_DEV_DOC'
+---
+
 # 豆包 QA 数据采集与分析系统 — 主流程开发文档
 
 > 版本：v1.1.3 · 最后更新：2026-03-19

@@ -1,5 +1,16 @@
 # docs 导航
 
+## GitHub Pages 文档站
+
+仓库 **Settings → Pages** 中：**Build and deployment → Branch `main`，Folder `/docs`**，保存后即可在线浏览：
+
+**<https://chinakeyboardman.github.io/doubao-web-qa-spider-analyze/>**
+
+- 首页为 [`index.md`](index.md)（导航）；本 `README.md` 仅在 GitHub 浏览 `docs/` 目录时展示，不参与 Jekyll 构建。
+- 本地预览（可选）：`cd docs && bundle install && bundle exec jekyll serve`，浏览器打开 `http://127.0.0.1:4000/doubao-web-qa-spider-analyze/`（需安装 Ruby / Bundler）。
+
+---
+
 为减少重复文档和过期说明，`docs/` 按「日常运行优先」组织如下：
 
 ## 1) 先看这三份

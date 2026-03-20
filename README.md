@@ -125,6 +125,8 @@ python import_queries.py
 
 ## 文档
 
+**在线浏览（GitHub Pages）**：<https://chinakeyboardman.github.io/doubao-web-qa-spider-analyze/>（仓库 **Settings → Pages** 选择分支 `main`、目录 `/docs` 后生效）
+
 项目文档集中在 `docs/` 目录，主要包含：
 
 - **CLI_COMMANDS.md**：**脚本命令速查**（run/collect/crawl/structure/run-sync/export 等）
