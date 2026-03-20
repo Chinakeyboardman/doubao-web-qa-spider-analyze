@@ -6,7 +6,7 @@
 
 - `CLI_COMMANDS.md`：命令速查，含依赖服务预检说明（最常用）
 - `CHECKLIST.md`：当前进度、关键变更、验收记录
-- `PIPELINE_DEV_DOC.md`：完整主流程说明、性能基线、Schema
+- `PIPELINE_DEV_DOC.md`：完整主流程说明、性能基线（各 Step 与 **§11** 已按 2026-03 优化后观测更新）、Schema
 
 ## 2) 流程与规范
 

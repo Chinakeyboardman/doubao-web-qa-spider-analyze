@@ -233,7 +233,7 @@ doubao-web-qa-spider-analyze/
 - [x] 新增精细化结构化入口：`run.py structure` 支持 `--link-ids`，可按单条/少量 link 执行 structure（避免一次跑太多）
 - [x] 导出脚本补齐 5 张 QA 表：`export_db_excel.py` 新增 `qa_link_video` sheet；`export_qa.py` 新增视频资源统计与字段导出
 - [x] CLI 启动预检：`run.py` 增加 PostgreSQL/抖音下载 API 自动提示（依赖未就绪时 fail-fast 或 warn）
-- [x] 文档更新：`CLI_COMMANDS.md` 补充 audio/link-ids/5表导出与依赖预检说明；`PIPELINE_DEV_DOC.md` 补齐 Step2.6 与最新耗时区间
+- [x] 文档更新：`CLI_COMMANDS.md` 补充 audio/link-ids/5表导出与依赖预检说明；`PIPELINE_DEV_DOC.md` 补齐 Step2.6 与最新耗时区间（2026-03-20：Collect/Crawl/Audio/Structure 各节与 §11 已按优化后观测再修订）
 - [x] docs 目录清理：移除过期 `douyin-crawler-worker-README.md`、`douyin-crawler-CLAUDE.md`，新增 `docs/README.md` 导航
 
 #### 4.9 平台识别修复 + 空内容数据修复 ✅

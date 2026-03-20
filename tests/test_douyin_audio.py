@@ -20,6 +20,7 @@ from integration.douyin_audio_transcriber import (  # noqa: E402
     batch_process,
     download_video,
     extract_compress_audio,
+    mark_link_video_text_bgm_done,
     process_one,
     transcribe_with_seedasr_v2,
 )
@@ -151,16 +152,25 @@ class DouyinAudioUnitTests(unittest.TestCase):
 
     @patch("httpx.Client")
     def test_download_video_success(self, mock_client_class):
-        """测试 download_video 在 API 返回视频数据时正确写入。"""
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.content = b"fake video content from api"
-        mock_resp.raise_for_status = MagicMock()
+        """测试 download_video 在 API 流式返回视频数据时正确写入。"""
+        content = b"fake video content from api"
+        mock_stream_resp = MagicMock()
+        mock_stream_resp.status_code = 200
+        mock_stream_resp.headers = {
+            "content-type": "video/mp4",
+            "content-length": str(len(content)),
+        }
+        mock_stream_resp.raise_for_status = MagicMock()
+        mock_stream_resp.iter_bytes = lambda chunk_size=None: iter([content])
+
+        mock_stream_cm = MagicMock()
+        mock_stream_cm.__enter__ = MagicMock(return_value=mock_stream_resp)
+        mock_stream_cm.__exit__ = MagicMock(return_value=False)
 
         mock_client = MagicMock()
         mock_client.__enter__ = MagicMock(return_value=mock_client)
         mock_client.__exit__ = MagicMock(return_value=False)
-        mock_client.get.return_value = mock_resp
+        mock_client.stream.return_value = mock_stream_cm
         mock_client_class.return_value = mock_client
 
         with tempfile.TemporaryDirectory() as td:
@@ -173,7 +183,7 @@ class DouyinAudioUnitTests(unittest.TestCase):
             )
             self.assertEqual(result, out_path)
             self.assertTrue(out_path.exists())
-            self.assertEqual(out_path.read_bytes(), b"fake video content from api")
+            self.assertEqual(out_path.read_bytes(), content)
 
     def test_file_basename_with_video_id(self):
         """测试 _file_basename 在 URL 含 video_id 时追加后缀。"""
@@ -289,6 +299,52 @@ class DouyinAudioUnitTests(unittest.TestCase):
                 self.assertEqual(result["stt_text"], "兜底文案")
                 self.assertEqual(result["transcript_model"], "raw_text_fallback")
 
+    @patch("integration.douyin_audio_transcriber.oss_upload")
+    @patch("integration.douyin_audio_transcriber.transcribe_with_seedasr_v2")
+    @patch("integration.douyin_audio_transcriber.extract_compress_audio")
+    @patch("integration.douyin_audio_transcriber.download_video")
+    def test_process_one_bgm_no_speech_uses_combined_text(
+        self,
+        mock_download_video,
+        mock_extract_audio,
+        mock_transcribe,
+        mock_oss_upload,
+    ):
+        """ASR 报静音/无口播且页面有足够文本时：done + text_content_bgm_no_asr + parse_note。"""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            with patch.object(transcriber, "_EXPORT_ROOT", td_path):
+                def _download(_url, _api_base, output_path):
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_bytes(b"fake video")
+                    return output_path
+
+                def _extract(_video_path, audio_path):
+                    audio_path.write_bytes(b"fake mp3")
+                    return audio_path
+
+                mock_download_video.side_effect = _download
+                mock_extract_audio.side_effect = _extract
+                mock_oss_upload.side_effect = lambda local, key: f"https://oss.example.com/{key}"
+                mock_transcribe.side_effect = RuntimeError("SeedASR 返回静音音频: request_id=x")
+
+                result = process_one(
+                    link_id="Q0001_L001",
+                    query_id="Q0001",
+                    link_url="https://www.iesdouyin.com/share/video/1",
+                    raw_json={
+                        "title": "标题",
+                        "raw_text": "这是一段足够长的简介内容用于测试兜底",
+                    },
+                )
+
+                self.assertFalse(result["skipped"])
+                self.assertEqual(result["transcript_source"], "text_content_bgm_no_asr")
+                self.assertEqual(result["transcript_model"], "text_content_bgm_no_asr")
+                self.assertIn("parse_note", result)
+                self.assertIn("背景音乐", result["parse_note"])
+                self.assertIn("标题", result["stt_text"])
+
     @patch("integration.douyin_audio_transcriber.execute")
     @patch("shared.claim_functions.claim_pending_video_parse_v2")
     @patch("integration.douyin_audio_transcriber.process_one")
@@ -319,6 +375,64 @@ class DouyinAudioUnitTests(unittest.TestCase):
         sql_calls = [c.args[0] for c in mock_execute.call_args_list]
         self.assertTrue(any("UPDATE qa_link_content" in sql for sql in sql_calls))
         self.assertTrue(any("video_parse_status" in sql for sql in sql_calls))
+
+
+class MarkBgmTextDoneUnitTests(unittest.TestCase):
+    """模拟 Q0233_L014 类数据：仅测逻辑，不访问数据库（fetch_one / _sync_to_content 全部 mock）。"""
+
+    @patch("integration.douyin_audio_transcriber._sync_to_content")
+    @patch("shared.db.fetch_one")
+    def test_mark_link_video_text_bgm_done_q0233_like_no_db_write(
+        self, mock_fetch_one, mock_sync,
+    ):
+        """与线上一致：音轨无口播、页面有足量文本 → text_content_bgm_no_asr + parse_note；不落库。"""
+        raw_like_q0233 = {
+            "title": "小象超市冰淇淋🍦亲测封神！平价天花板",
+            "raw_text": (
+                "小象超市冰淇淋🍦亲测封神！平价天花板\n"
+                "我自己作为冰淇淋脑袋\n小象超市这款我直接无限回购！\n"
+                "🍨 口感用料\n鲜奶基底超绵密，无添加口感真实。"
+            ),
+        }
+        mock_fetch_one.return_value = {
+            "vid": 424242,
+            "query_id": "Q0233",
+            "raw_json": raw_like_q0233,
+            "video_path": "https://oss.example.com/export/media/Q0233/Q0233_L014_7618861518550407094.mp4",
+            "audio_path": "https://oss.example.com/export/media/Q0233/Q0233_L014_7618861518550407094.mp3",
+        }
+
+        ok = mark_link_video_text_bgm_done("Q0233_L014")
+
+        self.assertTrue(ok)
+        mock_fetch_one.assert_called_once()
+        mock_sync.assert_called_once()
+        _vid, link_id, result, raw = mock_sync.call_args[0]
+        self.assertEqual(link_id, "Q0233_L014")
+        self.assertEqual(_vid, 424242)
+        self.assertEqual(result["transcript_source"], "text_content_bgm_no_asr")
+        self.assertEqual(result["transcript_model"], "text_content_bgm_no_asr")
+        self.assertIn("背景音乐", result["parse_note"])
+        self.assertIn("小象超市", result["stt_text"])
+        self.assertIn("parse_note", result)
+        # 合并正文应包含标题与正文
+        self.assertIn("小象超市冰淇淋", result["stt_text"])
+        self.assertEqual(
+            result["video_path"],
+            "https://oss.example.com/export/media/Q0233/Q0233_L014_7618861518550407094.mp4",
+        )
+
+    @patch("shared.db.fetch_one")
+    def test_mark_link_video_text_bgm_done_short_text_returns_false(self, mock_fetch_one):
+        mock_fetch_one.return_value = {
+            "vid": 1,
+            "query_id": "Q0233",
+            "raw_json": {"title": "短", "raw_text": ""},
+            "video_path": "",
+            "audio_path": "",
+        }
+        ok = mark_link_video_text_bgm_done("Q0233_L099", min_chars=15)
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

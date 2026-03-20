@@ -110,79 +110,100 @@ def main():
     args = parser.parse_args()
 
     project_root = _PROJECT_ROOT
-    print("1. 查询需要上传的 qa_link_video 记录...")
+    print("1. 分批查询需要上传的 qa_link_video 记录...")
 
-    rows = fetch_all(
-        """
-        SELECT v.id, v.link_id, v.video_path, v.audio_path, l.query_id
-        FROM qa_link_video v
-        JOIN qa_link l ON v.link_id = l.link_id
-        WHERE (v.video_path IS NOT NULL AND v.video_path != '' AND v.video_path NOT LIKE 'http%%')
-           OR (v.audio_path IS NOT NULL AND v.audio_path != '' AND v.audio_path NOT LIKE 'http%%')
-        ORDER BY v.id
-        """
-    )
-    if args.limit:
-        rows = rows[: args.limit]
-        print(f"   共 {len(rows)} 条待处理（--limit {args.limit}）")
-    else:
-        print(f"   共 {len(rows)} 条待处理")
-
+    batch_size = 200
+    last_id = 0
+    total_rows = 0
     updated_video = 0
     updated_content = 0
     dry_run = args.dry_run
 
-    for i, r in enumerate(rows):
-        vid = r["id"]
-        link_id = r["link_id"]
-        vp = r.get("video_path")
-        ap = r.get("audio_path")
-        if (i + 1) % 100 == 0 or i == 0:
-            print(f"  [{i + 1}/{len(rows)}] link_id={link_id}")
-
-        new_vp, new_ap = process_one(vid, link_id, vp, ap, project_root)
-        if not new_vp and not new_ap:
-            continue
-
-        final_vp = new_vp if new_vp else (vp or "")
-        final_ap = new_ap if new_ap else (ap or "")
-
-        if not dry_run:
-            execute(
-                "UPDATE qa_link_video SET video_path = %s, audio_path = %s WHERE id = %s",
-                (final_vp, final_ap, vid),
-            )
-        updated_video += 1
-
-        # 更新 qa_link_content.raw_json.audio_info
-        content_rows = fetch_all(
-            "SELECT link_id, raw_json FROM qa_link_content WHERE link_id = %s",
-            (link_id,),
+    def fetch_batch():
+        nonlocal last_id
+        limit = batch_size
+        if args.limit:
+            limit = min(batch_size, args.limit - total_rows)
+            if limit <= 0:
+                return []
+        rows = fetch_all(
+            """
+            SELECT v.id, v.link_id, v.video_path, v.audio_path, l.query_id
+            FROM qa_link_video v
+            JOIN qa_link l ON v.link_id = l.link_id
+            WHERE ((v.video_path IS NOT NULL AND v.video_path != '' AND v.video_path NOT LIKE 'http%%')
+               OR (v.audio_path IS NOT NULL AND v.audio_path != '' AND v.audio_path NOT LIKE 'http%%'))
+              AND v.id > %s
+            ORDER BY v.id
+            LIMIT %s
+            """,
+            (last_id, limit),
         )
-        for cr in content_rows:
-            raw = cr["raw_json"]
-            if isinstance(raw, str):
-                raw = json.loads(raw) if raw else {}
-            elif raw is None:
-                raw = {}
-            ai = raw.get("audio_info")
-            if not isinstance(ai, dict):
+        if rows:
+            last_id = rows[-1]["id"]
+        return rows
+
+    while True:
+        rows = fetch_batch()
+        if not rows:
+            break
+        if args.limit and total_rows >= args.limit:
+            break
+        total_rows += len(rows)
+        if total_rows == len(rows):
+            print(f"   共约 {len(rows)}+ 条待处理（分批 {batch_size}）")
+
+        for i, r in enumerate(rows):
+            vid = r["id"]
+            link_id = r["link_id"]
+            vp = r.get("video_path")
+            ap = r.get("audio_path")
+            if (i + 1) % 100 == 0 or i == 0:
+                print(f"  [{total_rows - len(rows) + i + 1}] link_id={link_id}")
+
+            new_vp, new_ap = process_one(vid, link_id, vp, ap, project_root)
+            if not new_vp and not new_ap:
                 continue
-            changed = False
-            if new_vp and (ai.get("video_path") == vp or _is_local_path(ai.get("video_path"))):
-                ai["video_path"] = new_vp
-                changed = True
-            if new_ap and (ai.get("audio_path") == ap or _is_local_path(ai.get("audio_path"))):
-                ai["audio_path"] = new_ap
-                changed = True
-            if changed:
-                raw["audio_info"] = ai
-                if not dry_run:
-                    execute(
-                        "UPDATE qa_link_content SET raw_json = %s WHERE link_id = %s",
-                        (json.dumps(raw, ensure_ascii=False), link_id),
-                    )
-                updated_content += 1
+
+            final_vp = new_vp if new_vp else (vp or "")
+            final_ap = new_ap if new_ap else (ap or "")
+
+            if not dry_run:
+                execute(
+                    "UPDATE qa_link_video SET video_path = %s, audio_path = %s WHERE id = %s",
+                    (final_vp, final_ap, vid),
+                )
+            updated_video += 1
+
+            # 更新 qa_link_content.raw_json.audio_info
+            content_rows = fetch_all(
+                "SELECT link_id, raw_json FROM qa_link_content WHERE link_id = %s",
+                (link_id,),
+            )
+            for cr in content_rows:
+                raw = cr["raw_json"]
+                if isinstance(raw, str):
+                    raw = json.loads(raw) if raw else {}
+                elif raw is None:
+                    raw = {}
+                ai = raw.get("audio_info")
+                if not isinstance(ai, dict):
+                    continue
+                changed = False
+                if new_vp and (ai.get("video_path") == vp or _is_local_path(ai.get("video_path"))):
+                    ai["video_path"] = new_vp
+                    changed = True
+                if new_ap and (ai.get("audio_path") == ap or _is_local_path(ai.get("audio_path"))):
+                    ai["audio_path"] = new_ap
+                    changed = True
+                if changed:
+                    raw["audio_info"] = ai
+                    if not dry_run:
+                        execute(
+                            "UPDATE qa_link_content SET raw_json = %s WHERE link_id = %s",
+                            (json.dumps(raw, ensure_ascii=False), link_id),
+                        )
+                    updated_content += 1
 
     print(f"\n完成。qa_link_video 更新 {updated_video} 条，qa_link_content 更新 {updated_content} 条。")
     if dry_run:

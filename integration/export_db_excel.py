@@ -80,24 +80,47 @@ def export_table(
     ws.append(columns)
 
     total = 0
-    sql = f"SELECT * FROM {table_name}"
-    if where_clause:
-        sql += f" WHERE {where_clause}"
-    sql += f" ORDER BY {order_column}"
-    ss_cur = backend.get_server_side_cursor(conn, f"export_{table_name}", itersize=batch_size)
-    try:
-        ss_cur.execute(sql)
-        while True:
-            rows = ss_cur.fetchmany(batch_size)
-            if not rows:
-                break
-            rows = backend.adapt_rows([dict(r) if not isinstance(r, dict) else r for r in rows])
-            for row in rows:
-                ws.append([normalize_value(row.get(col)) for col in columns])
-            total += len(rows)
-            print(f"[{table_name}] exported {total} rows...")
-    finally:
-        ss_cur.close()
+    # 使用 id 分批避免 ORDER BY 全表导致 sort buffer 不足
+    if order_column == "id" and "id" in columns:
+        last_id = 0
+        cur = backend.get_dict_cursor(conn)
+        try:
+            while True:
+                if where_clause:
+                    sql = f"SELECT * FROM {table_name} WHERE ({where_clause}) AND {order_column} > %s ORDER BY {order_column} LIMIT {batch_size}"
+                else:
+                    sql = f"SELECT * FROM {table_name} WHERE {order_column} > %s ORDER BY {order_column} LIMIT {batch_size}"
+                cur.execute(sql, (last_id,))
+                rows = cur.fetchall()
+                if not rows:
+                    break
+                rows = backend.adapt_rows([dict(r) if not isinstance(r, dict) else r for r in rows])
+                for row in rows:
+                    ws.append([normalize_value(row.get(col)) for col in columns])
+                total += len(rows)
+                last_id = rows[-1].get("id") or rows[-1].get(order_column)
+                print(f"[{table_name}] exported {total} rows...")
+        finally:
+            cur.close()
+    else:
+        sql = f"SELECT * FROM {table_name}"
+        if where_clause:
+            sql += f" WHERE {where_clause}"
+        sql += f" ORDER BY {order_column}"
+        ss_cur = backend.get_server_side_cursor(conn, f"export_{table_name}", itersize=batch_size)
+        try:
+            ss_cur.execute(sql)
+            while True:
+                rows = ss_cur.fetchmany(batch_size)
+                if not rows:
+                    break
+                rows = backend.adapt_rows([dict(r) if not isinstance(r, dict) else r for r in rows])
+                for row in rows:
+                    ws.append([normalize_value(row.get(col)) for col in columns])
+                total += len(rows)
+                print(f"[{table_name}] exported {total} rows...")
+        finally:
+            ss_cur.close()
     return total
 
 

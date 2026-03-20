@@ -130,7 +130,7 @@ def _check_douyin_api_or_hint(*, required: bool) -> bool:
 def _preflight_dependencies(command: str) -> bool:
     """Dependency checks before expensive pipeline bootstrap."""
     db_required = {
-        "run", "collect", "crawl", "enrich-douyin", "audio-transcribe", "structure",
+        "run", "collect", "crawl", "enrich-douyin", "audio-transcribe", "audio-bgm-text-done", "structure",
         "regenerate-content", "status", "retry", "recollect", "recollect-web-only",
         "run-until", "run-sync", "export", "export-excel", "web-collect",
     }
@@ -209,6 +209,17 @@ def cmd_audio_transcribe(args):
     print(f"Audio transcribed {count} Douyin link(s)")
 
 
+def cmd_audio_bgm_text_done(args):
+    """音轨无口播但页面有文本：标记 done + parse_note（见 douyin_audio_transcriber）。"""
+    from integration.douyin_audio_transcriber import mark_link_video_text_bgm_done
+
+    lids = [x.strip() for x in (args.link_ids or "").split(",") if x.strip()]
+    note = (getattr(args, "parse_note", None) or "").strip() or None
+    for lid in lids:
+        ok = mark_link_video_text_bgm_done(lid, parse_note=note)
+        print(f"{lid}: {'ok' if ok else 'fail'}")
+
+
 def cmd_structure(args):
     from integration.pipeline import QAPipeline
     pipeline = QAPipeline()
@@ -235,6 +246,12 @@ def cmd_status(args):
     from integration.pipeline import QAPipeline
     stats = QAPipeline.status()
     print(json.dumps(stats, ensure_ascii=False, indent=2))
+
+
+def cmd_range_status(args):
+    """Show status for query_id range (queries/links/video counters)."""
+    snap = _range_status_snapshot(args.start, args.end)
+    print(json.dumps(snap, indent=2, ensure_ascii=False))
 
 
 def cmd_retry(args):
@@ -831,6 +848,17 @@ def main():
     p_audio.add_argument("--audio-batch-size", type=int, default=1000, help="单次队列消费 link 数（默认1000）")
     p_audio.set_defaults(func=cmd_audio_transcribe)
 
+    p_abgm = sub.add_parser(
+        "audio-bgm-text-done",
+        help="BGM/无口播但页面有文本：将 link 标为视频解析 done，stt 用标题/简介，写入 parse_note",
+    )
+    p_abgm.add_argument("--link-ids", required=True, help="逗号分隔 link_id")
+    p_abgm.add_argument(
+        "--parse-note",
+        help="自定义说明（默认使用内置文案：音轨为 BGM+正文走文本+LLM）",
+    )
+    p_abgm.set_defaults(func=cmd_audio_bgm_text_done)
+
     p_struct = sub.add_parser("structure", help="Structure raw content only")
     p_struct.add_argument("--query-ids", help="逗号分隔 query_id，仅结构化这些 query 的链接")
     p_struct.add_argument("--link-ids", help="逗号分隔 link_id，仅结构化这些链接")
@@ -845,6 +873,11 @@ def main():
 
     p_status = sub.add_parser("status", help="Show pipeline status")
     p_status.set_defaults(func=cmd_status)
+
+    p_range_status = sub.add_parser("range-status", help="Show status for query_id range")
+    p_range_status.add_argument("--start", required=True, help="起始 query_id")
+    p_range_status.add_argument("--end", required=True, help="结束 query_id")
+    p_range_status.set_defaults(func=cmd_range_status)
 
     p_retry = sub.add_parser("retry", help="Reset failed items to pending")
     p_retry.add_argument(

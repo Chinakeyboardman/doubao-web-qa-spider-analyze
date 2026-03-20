@@ -89,18 +89,22 @@ def _serialize_row(row: dict) -> dict:
 def build_full_data() -> dict:
     """从数据库组装完整导出结构（用于 JSON）。"""
     stats = _query_stats()
+    # 去掉 ORDER BY 避免 MySQL sort buffer；在应用层按 id 排序
     queries = fetch_all(
-        "SELECT query_id, query_text, category, intent_type, status, created_at, updated_at FROM qa_query ORDER BY id"
+        "SELECT id, query_id, query_text, category, intent_type, status, created_at, updated_at FROM qa_query"
     )
+    queries.sort(key=lambda r: r.get("id") or 0)
     qid_to_answer = {}
     for row in fetch_all(
         "SELECT query_id, answer_text, answer_length, has_citation, citation_count, raw_data, created_at FROM qa_answer"
     ):
         qid_to_answer[row["query_id"]] = _serialize_row(dict(row))
     qid_to_links = {}
-    for row in fetch_all(
-        "SELECT query_id, link_id, link_url, platform, content_format, status, publish_time, popularity, fetched_at, created_at FROM qa_link ORDER BY query_id, id"
-    ):
+    link_rows = fetch_all(
+        "SELECT id, query_id, link_id, link_url, platform, content_format, status, publish_time, popularity, fetched_at, created_at FROM qa_link"
+    )
+    link_rows.sort(key=lambda r: (r.get("query_id", ""), r.get("id") or 0))
+    for row in link_rows:
         qid = row["query_id"]
         if qid not in qid_to_links:
             qid_to_links[qid] = []

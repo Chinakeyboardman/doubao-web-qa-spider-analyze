@@ -118,13 +118,19 @@ CREATE TABLE IF NOT EXISTS qa_link_video (
 CREATE INDEX idx_qa_query_category     ON qa_query(category);
 CREATE INDEX idx_qa_query_intent       ON qa_query(intent_type);
 CREATE INDEX idx_qa_query_date         ON qa_query(query_date);
+CREATE INDEX idx_qa_query_status_id    ON qa_query(status, id);
+CREATE INDEX idx_qa_query_status_updated ON qa_query(status, updated_at);
 CREATE INDEX idx_qa_answer_query_id    ON qa_answer(query_id);
 CREATE INDEX idx_qa_link_query_id      ON qa_link(query_id);
 CREATE INDEX idx_qa_link_platform      ON qa_link(platform);
 CREATE INDEX idx_qa_link_format        ON qa_link(content_format);
+CREATE INDEX idx_qa_link_status        ON qa_link(status);
+CREATE INDEX idx_qa_link_status_id     ON qa_link(status, id);
+CREATE INDEX idx_qa_link_platform_status ON qa_link(platform, status);
 CREATE INDEX idx_qa_link_content_link  ON qa_link_content(link_id);
 CREATE INDEX idx_qa_link_video_status  ON qa_link_video(status);
 CREATE INDEX idx_qa_link_video_link_id ON qa_link_video(link_id);
+CREATE INDEX idx_qa_link_video_link_status ON qa_link_video(link_id, status);
 
 -- ============================================
 -- updated_at 自动更新触发器

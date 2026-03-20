@@ -30,6 +30,11 @@ _DEFAULT_API_BASE = CONFIG.get("douyin_api", {}).get("url", "http://localhost:80
 _MAX_PROMPT_AUDIO_CHARS = int(os.getenv("DOUYIN_AUDIO_MAX_TRANSCRIPT_CHARS", "6000"))
 _ASR_TIMEOUT_SECONDS = int(os.getenv("VOLCENGINE_ASR_TIMEOUT_SECONDS", "300"))
 
+# 抖音本地下载 API：大文件易中途断连，需流式写入 + 多轮重试 + 读超时放宽
+_DOUYIN_DOWNLOAD_MAX_RETRIES = max(1, int(os.getenv("DOUYIN_DOWNLOAD_MAX_RETRIES", "5")))
+_DOUYIN_DOWNLOAD_READ_TIMEOUT = float(os.getenv("DOUYIN_DOWNLOAD_READ_TIMEOUT_SECONDS", "900"))
+_DOUYIN_DOWNLOAD_CHUNK_BYTES = max(65536, int(os.getenv("DOUYIN_DOWNLOAD_CHUNK_BYTES", str(256 * 1024))))
+
 _ASR_APP_ID = (CONFIG.get("asr", {}).get("app_id") or "").strip()
 _ASR_ACCESS_TOKEN = (CONFIG.get("asr", {}).get("access_token") or "").strip()
 _ASR_RESOURCE_ID = (CONFIG.get("asr", {}).get("resource_id") or "volc.seedasr.auc").strip()
@@ -45,61 +50,333 @@ _ASR_QUERY_URL = CONFIG.get("asr", {}).get(
 _to_raw_dict = to_raw_dict
 _has_meaningful_subtitles = has_meaningful_subtitles
 
+# 音轨为 BGM/歌曲、ASR 无有效口播，但页面仍有标题/简介等文字时：标记 done，正文走文本+后续 LLM（非音轨转写）
+_DEFAULT_BGM_PARSE_NOTE = (
+    "音轨主要为背景音乐或歌曲，ASR 无有效口播；stt_text 采用页面标题/简介等文本。"
+    "后续结构化由 LLM 基于文本与元数据理解（非音轨转写）。"
+)
+_BGM_FALLBACK_MIN_CHARS = int(os.getenv("DOUYIN_BGM_TEXT_MIN_CHARS", "15"))
+
+
+def _crawl_combined_text(raw: dict) -> str:
+    """合并标题、简介、caption，供 BGM/ASR 失败时的正文兜底。"""
+    title = (raw.get("title") or "").strip()
+    raw_text = (raw.get("raw_text") or "").strip()
+    cap = (raw.get("caption") or "").strip()
+    parts = [p for p in (title, raw_text, cap) if p]
+    return "\n".join(parts).strip()
+
+
+def _is_asr_no_speech_like(exc: BaseException) -> bool:
+    """SeedASR 静音、空文本等：不适合继续要求音轨转写。"""
+    s = str(exc)
+    markers = (
+        "静音",
+        "20000003",
+        "空文本",
+        "SeedASR 返回空文本",
+        "返回静音",
+    )
+    return any(m in s for m in markers)
+
 
 # ---------------------------------------------------------------------------
 # 视频下载 & 音频提取（保留原有逻辑）
 # ---------------------------------------------------------------------------
 
+def _truncate_error_for_db(message: str, *, max_len: int = 2000) -> str:
+    """入库错误信息：保留末尾（ffmpeg/网络真实原因多在尾部），避免 [:500] 只剩版本横幅。"""
+    s = (message or "").strip()
+    if len(s) <= max_len:
+        return s
+    return f"...[trunc head {len(s) - max_len + 40} chars]...\n" + s[-(max_len - 40) :]
+
+
+def _parse_download_api_json_error(data: bytes) -> str | None:
+    """若响应体为 JSON 错误，返回可读信息。"""
+    if len(data) > 64 * 1024 or not data.strip().startswith(b"{"):
+        return None
+    try:
+        payload = json.loads(data.decode("utf-8", errors="ignore"))
+    except json.JSONDecodeError:
+        return None
+    detail = payload.get("detail")
+    if isinstance(detail, dict):
+        msg = detail.get("message", str(detail))
+    else:
+        msg = payload.get("message") or str(payload)
+    return str(msg)[:500]
+
+
 def download_video(link_url: str, api_base: str, output_path: Path) -> Path:
-    """通过本地下载 API 下载抖音视频，连接失败重试一次。"""
+    """通过本地下载 API 下载抖音视频。
+
+    使用 **流式写入** + **Content-Length 校验** + **多轮重试**，缓解大文件中途断连
+    （如 peer closed connection without complete body）。
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     download_url = f"{api_base}/api/download?url={quote(link_url)}&with_watermark=false"
+    part_path = output_path.parent / f"{output_path.name}.part"
+
+    timeout = httpx.Timeout(
+        connect=30.0,
+        read=_DOUYIN_DOWNLOAD_READ_TIMEOUT,
+        write=30.0,
+        pool=30.0,
+    )
     last_err: Exception | None = None
-    for attempt in range(2):
+
+    for attempt in range(_DOUYIN_DOWNLOAD_MAX_RETRIES):
+        wait = min(60.0, 2.0 ** min(attempt, 5))
         try:
-            with httpx.Client(timeout=180, follow_redirects=True) as client:
-                resp = client.get(download_url)
-                resp.raise_for_status()
-                data = resp.content
-            last_err = None
-            break
-        except (httpx.RemoteProtocolError, httpx.ConnectError, OSError) as e:
-            last_err = e
-            if attempt == 0:
-                logger.warning("[download] %s attempt %s failed: %s", output_path.name, attempt + 1, str(e)[:120])
+            part_path.unlink(missing_ok=True)
+            expected_len: int | None = None
+            received = 0
+
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                with client.stream("GET", download_url) as resp:
+                    resp.raise_for_status()
+                    cl = resp.headers.get("content-length")
+                    if cl and str(cl).isdigit():
+                        expected_len = int(cl)
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    if "application/json" in ct or "text/json" in ct:
+                        data = resp.read()
+                        if _parse_download_api_json_error(data):
+                            raise RuntimeError(
+                                f"Douyin download API returned error: {_parse_download_api_json_error(data)}"
+                            )
+                        raise RuntimeError("Douyin download API returned JSON instead of video")
+
+                    with open(part_path, "wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=_DOUYIN_DOWNLOAD_CHUNK_BYTES):
+                            received += len(chunk)
+                            f.write(chunk)
+
+            if expected_len is not None and received != expected_len:
+                part_path.unlink(missing_ok=True)
+                last_err = RuntimeError(
+                    f"incomplete download: received {received} bytes, expected {expected_len}"
+                )
+                logger.warning(
+                    "[download] %s attempt %s/%s: %s — retry in %.1fs",
+                    output_path.name,
+                    attempt + 1,
+                    _DOUYIN_DOWNLOAD_MAX_RETRIES,
+                    last_err,
+                    wait,
+                )
+                time.sleep(wait)
                 continue
-            raise RuntimeError(f"download failed after retry: {e}") from e
-    if last_err is not None:
-        raise RuntimeError(f"download failed: {last_err}") from last_err
 
-    if len(data) < 10 * 1024 and data.strip().startswith(b"{"):
-        try:
-            payload = json.loads(data.decode("utf-8", errors="ignore"))
-            detail = payload.get("detail")
-            if isinstance(detail, dict):
-                msg = detail.get("message", str(detail))
-            else:
-                msg = payload.get("message") or str(payload)
-            raise RuntimeError(f"Douyin download API returned error: {str(msg)[:200]}")
-        except json.JSONDecodeError:
-            pass
+            raw = part_path.read_bytes()
+            if len(raw) < 10 * 1024 and raw.strip().startswith(b"{"):
+                err_txt = _parse_download_api_json_error(raw)
+                part_path.unlink(missing_ok=True)
+                if err_txt:
+                    raise RuntimeError(f"Douyin download API returned error: {err_txt}")
+                raise RuntimeError("Douyin download API returned JSON error body")
 
-    output_path.write_bytes(data)
-    return output_path
+            part_path.replace(output_path)
+            return output_path
+
+        except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError, httpx.HTTPStatusError, OSError) as e:
+            last_err = e
+            part_path.unlink(missing_ok=True)
+            logger.warning(
+                "[download] %s attempt %s/%s failed: %s — retry in %.1fs",
+                output_path.name,
+                attempt + 1,
+                _DOUYIN_DOWNLOAD_MAX_RETRIES,
+                str(e)[:240],
+                wait,
+            )
+            time.sleep(wait)
+        except RuntimeError:
+            part_path.unlink(missing_ok=True)
+            raise
+
+    raise RuntimeError(
+        f"Douyin download failed after {_DOUYIN_DOWNLOAD_MAX_RETRIES} attempts: {last_err}"
+    ) from last_err
+
+
+def _ffprobe_audio_stream_count(video_path: Path) -> int:
+    """返回视频中音轨数量；ffprobe 不可用时返回 -1（调用方继续尝试 ffmpeg）。"""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        str(video_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return -1
+    if proc.returncode != 0:
+        return -1
+    lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    return len(lines)
+
+
+def _ffmpeg_error_snippet(proc: subprocess.CompletedProcess, *, max_chars: int = 3000) -> str:
+    """ffmpeg 失败时真正有用的信息往往在 stderr 末尾（前几行多为版本横幅）。"""
+    combined = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+    if not combined:
+        return f"(ffmpeg produced no stderr/stdout; exit code {proc.returncode})"
+    if len(combined) <= max_chars:
+        return combined
+    return "...[truncated head]...\n" + combined[-max_chars:]
+
+
+def _run_ffmpeg_extract_to_mp3(video_path: Path, audio_path: Path, *, extra_args: list[str]) -> subprocess.CompletedProcess:
+    """执行一次 ffmpeg：抽取第一条音轨 → mp3（16kHz 单声道 64kbps）。"""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *extra_args,
+        "-i",
+        str(video_path),
+        "-vn",
+        "-map",
+        "0:a:0",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        str(audio_path),
+    ]
+    return subprocess.run(cmd, capture_output=True, text=True)
 
 
 def extract_compress_audio(video_path: Path, audio_path: Path) -> Path:
-    """用 ffmpeg 从视频中提取音频并压缩为 mp3（16kHz 单声道 64kbps）。"""
+    """用 ffmpeg 从视频中提取音频并压缩为 mp3（16kHz 单声道 64kbps）。
+
+    部分抖音下载的 mp4 时间戳/封装异常，单次默认参数会失败；依次尝试更宽容的解码选项。
+    """
+    if not video_path.exists() or video_path.stat().st_size < 512:
+        raise RuntimeError(f"video file missing or too small: {video_path}")
+
+    n_audio = _ffprobe_audio_stream_count(video_path)
+    if n_audio == 0:
+        raise RuntimeError(f"no audio stream in video (ffprobe): {video_path}")
+
     audio_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y", "-i", str(video_path),
-        "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
-        str(audio_path),
+    if audio_path.exists():
+        try:
+            audio_path.unlink()
+        except OSError:
+            pass
+
+    # 尝试顺序：默认 → 容错时间戳/损坏包 → 忽略部分解码错误
+    attempts: list[tuple[str, list[str]]] = [
+        ("default", []),
+        (
+            "genpts_discardcorrupt",
+            ["-fflags", "+genpts+discardcorrupt", "-probesize", "50M", "-analyzeduration", "10M"],
+        ),
+        (
+            "ignore_err",
+            [
+                "-fflags",
+                "+genpts+discardcorrupt",
+                "-err_detect",
+                "ignore_err",
+                "-probesize",
+                "50M",
+                "-analyzeduration",
+                "10M",
+            ],
+        ),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg audio extract failed: {(proc.stderr or proc.stdout)[:500]}")
-    return audio_path
+
+    last_proc: subprocess.CompletedProcess | None = None
+    for name, extra in attempts:
+        proc = _run_ffmpeg_extract_to_mp3(video_path, audio_path, extra_args=extra)
+        last_proc = proc
+        if proc.returncode == 0 and audio_path.exists() and audio_path.stat().st_size > 0:
+            if name != "default":
+                logger.info(
+                    "[audio] ffmpeg extract ok with %s for %s", name, video_path.name
+                )
+            return audio_path
+
+    # 最后一招：先抽 16k 单声道 wav（部分流 libmp3lame 直接封装失败，pcm 可过）
+    wav_path = audio_path.with_suffix(".tmp.wav")
+    try:
+        if wav_path.exists():
+            wav_path.unlink()
+        wav_cmd = [
+            "ffmpeg",
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-err_detect",
+            "ignore_err",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "wav",
+            str(wav_path),
+        ]
+        wproc = subprocess.run(wav_cmd, capture_output=True, text=True)
+        if wproc.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 0:
+            mp3_cmd = [
+                "ffmpeg",
+                "-y",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(wav_path),
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                str(audio_path),
+            ]
+            mproc = subprocess.run(mp3_cmd, capture_output=True, text=True)
+            if mproc.returncode == 0 and audio_path.exists() and audio_path.stat().st_size > 0:
+                logger.info("[audio] ffmpeg extract ok via wav-pipeline for %s", video_path.name)
+                return audio_path
+            last_proc = mproc
+        else:
+            last_proc = wproc
+    finally:
+        try:
+            if wav_path.exists():
+                wav_path.unlink()
+        except OSError:
+            pass
+
+    err = _ffmpeg_error_snippet(last_proc) if last_proc else "no subprocess"
+    raise RuntimeError(f"ffmpeg audio extract failed after retries: {err}")
 
 
 # ---------------------------------------------------------------------------
@@ -290,19 +567,43 @@ def process_one(
     transcript_source = "seedasr_v2"
     transcript_model = "seedasr_v2"
 
+    parse_note = ""
     try:
         transcript, subtitles, duration_ms = transcribe_with_seedasr_v2(
             audio_oss_url, audio_format="mp3",
         )
     except Exception as asr_exc:
         logger.error("[audio] %s SeedASR 转写失败: %s", link_id, str(asr_exc)[:500], exc_info=True)
-        fallback_text = (raw.get("raw_text") or raw.get("caption") or "").strip()
-        if not fallback_text:
+        combined = _crawl_combined_text(raw)
+        single_fb = (raw.get("raw_text") or raw.get("caption") or "").strip()
+        # 合并正文优先于单字段，便于标题+简介都有内容时兜底
+        text_candidate = combined if len(combined) >= len(single_fb) else single_fb
+        if not text_candidate.strip():
+            text_candidate = combined or single_fb
+
+        if _is_asr_no_speech_like(asr_exc) and len(text_candidate.strip()) >= _BGM_FALLBACK_MIN_CHARS:
+            transcript = text_candidate.strip()
+            transcript_source = "text_content_bgm_no_asr"
+            transcript_model = "text_content_bgm_no_asr"
+            parse_note = _DEFAULT_BGM_PARSE_NOTE
+            subtitles = []
+            duration_ms = 0
+            logger.warning(
+                "[audio] %s ASR 无口播/静音类失败，采用页面文本兜底并标记 done（text_content_bgm_no_asr）",
+                link_id,
+            )
+        elif single_fb:
+            transcript = single_fb
+            transcript_source = "raw_text_fallback"
+            transcript_model = "raw_text_fallback"
+            logger.warning("[audio] %s 使用 raw_text 回退", link_id)
+        elif combined:
+            transcript = combined
+            transcript_source = "raw_text_fallback"
+            transcript_model = "raw_text_fallback"
+            logger.warning("[audio] %s 使用 title+简介合并 raw_text 回退", link_id)
+        else:
             raise RuntimeError(f"transcribe failed: {asr_exc}") from asr_exc
-        transcript = fallback_text
-        transcript_source = "raw_text_fallback"
-        transcript_model = "raw_text_fallback"
-        logger.warning("[audio] %s 使用 raw_text 回退", link_id)
 
     if not transcript:
         return {
@@ -312,7 +613,7 @@ def process_one(
             "video_path": video_oss_url,
         }
 
-    return {
+    out: dict = {
         "stt_text": transcript,
         "audio_path": audio_oss_url,
         "video_path": video_oss_url,
@@ -324,6 +625,9 @@ def process_one(
         "duration_ms": duration_ms,
         "skipped": False,
     }
+    if parse_note:
+        out["parse_note"] = parse_note
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +683,11 @@ def _sync_to_content(
     raw["audio_info"]["model_api_input_type"] = result.get("model_api_input_type", "")
     if result.get("duration_ms"):
         raw["audio_info"]["duration_ms"] = int(result["duration_ms"])
+    if (result.get("parse_note") or "").strip():
+        raw["audio_info"]["parse_note"] = (result.get("parse_note") or "").strip()
+    elif "parse_note" in raw.get("audio_info", {}):
+        # 新结果无说明时不清除旧字段（按需可改为 pop）
+        pass
 
     if subtitles:
         raw["subtitles"] = subtitles
@@ -408,12 +717,74 @@ def _sync_to_content(
         "stt_text = %s, video_path = %s, audio_path = %s, "
         "transcript_model = %s, transcript_source = %s, "
         "model_api_file_id = %s, subtitles = %s, "
-        "status = 'done', transcribed_at = CURRENT_TIMESTAMP "
+        "status = 'done', transcribed_at = CURRENT_TIMESTAMP, error_message = NULL "
         f"WHERE id = %s{ol_v}",
         params_v,
     )
     if video_updated_at and n == 0:
         logger.warning("[audio] qa_link_video id=%s optimistic lock failed (sync)", vid)
+
+
+def mark_link_video_text_bgm_done(
+    link_id: str,
+    *,
+    parse_note: str | None = None,
+    min_chars: int | None = None,
+) -> bool:
+    """人工确认：音轨无口播但页面有足量文本时，将 qa_link_video 标为 done。
+
+    - ``stt_text`` 使用标题+简介+caption 合并文本
+    - ``transcript_source`` = ``text_content_bgm_no_asr``
+    - ``raw_json.audio_info.parse_note`` 记录说明（默认 ``_DEFAULT_BGM_PARSE_NOTE``）
+    - 清空 ``qa_link_video.error_message``
+    """
+    from shared.db import fetch_one
+
+    row = fetch_one(
+        "SELECT v.id AS vid, l.query_id, lc.raw_json, v.video_path, v.audio_path "
+        "FROM qa_link_video v "
+        "JOIN qa_link l ON l.link_id = v.link_id "
+        "JOIN qa_link_content lc ON lc.link_id = v.link_id "
+        "WHERE v.link_id = %s",
+        (link_id,),
+    )
+    if not row:
+        logger.warning("[audio] mark text_bgm_done: link_id=%s not found", link_id)
+        return False
+
+    raw = _to_raw_dict(row.get("raw_json"))
+    combined = _crawl_combined_text(raw)
+    mc = int(min_chars if min_chars is not None else _BGM_FALLBACK_MIN_CHARS)
+    if len(combined.strip()) < mc:
+        logger.warning(
+            "[audio] mark text_bgm_done: combined text too short (%d chars, need >=%d) for %s",
+            len(combined.strip()),
+            mc,
+            link_id,
+        )
+        return False
+
+    note = (parse_note or _DEFAULT_BGM_PARSE_NOTE).strip()
+    vid = int(row["vid"])
+    vp = (row.get("video_path") or "").strip() or (raw.get("audio_info") or {}).get("video_path") or ""
+    ap = (row.get("audio_path") or "").strip() or (raw.get("audio_info") or {}).get("audio_path") or ""
+
+    result = {
+        "stt_text": combined.strip(),
+        "transcript_source": "text_content_bgm_no_asr",
+        "transcript_model": "text_content_bgm_no_asr",
+        "parse_note": note,
+        "audio_path": ap,
+        "video_path": vp,
+        "model_api_file_id": "",
+        "model_api_input_type": "input_audio",
+        "subtitles": [],
+        "duration_ms": 0,
+        "skipped": False,
+    }
+    _sync_to_content(vid, link_id, result, raw, video_updated_at=None, content_updated_at=None)
+    logger.info("[audio] marked text_bgm_done for %s", link_id)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +847,7 @@ def batch_process(
                         (raw.get("stt_text", ""), vid),
                     )
                 else:
-                    err_msg = str(reason)[:500]
+                    err_msg = _truncate_error_for_db(str(reason), max_len=2000)
                     _set_video_status(vid, link_id, "error", err_msg, video_updated_at=vo, content_updated_at=co)
                 logger.info("[audio] skip %s: %s", link_id, reason)
                 continue
