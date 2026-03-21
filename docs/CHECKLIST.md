@@ -204,6 +204,7 @@ doubao-web-qa-spider-analyze/
 - [x] 规则修正：对“回答存在但0参考链接”的 query 按成功处理（不再误判 error）；已回归验证 `Q0270 -> qa_query.done / qa_answer.citation_count=0 / qa_link=0`
 - [x] `data-clean/llm_extractor.py` 增加抖音空壳数据保护：当标题/简介/评论/字幕均为空时，直接跳过 seedance 调用并写入“未抓取到原始数据”说明，避免无效 LLM 费用
 - [x] Web 采集健壮性增强：`doubao_web_collector.collect_one` 增加默认对话框可输入检查（chat_not_ready）、发送前后诊断日志（pre_send/post_send）、超时结构化诊断日志（timeout_diag）
+- [x] **批量无引用排查**：同批 `web_ui` 采集但大量 `qa_link=0` 的统计与可能原因见 `docs/引用缺失原因与修复.md`（**单条如 Q0320 可能本身无参考资料，不能据此判定采集器失效**）；代码侧增强 `_switch_to_think_mode`（多文案/深度思考）、统一抽取、展开面板、`DOUBAO_WEB_POST_ANSWER_SETTLE_MS` 与可选 `DOUBAO_WEB_CITATION_RETRY_MS`
 - [x] 风控恢复顺序升级：`pipeline._collect_one_with_risk_recovery` 固化为「先换账号（switch_account）→ 再弹窗人工处理（headed manual）」并记录分阶段日志
 - [x] 新增仅 Web 重跑命令：`integration/run.py recollect-web-only`（默认重跑 Q0011~Q0016,Q0305~Q0309），且 `run-sync --collect-batch-size` 默认改为 1（answer 串行）
 - [x] 新增 Step 2.6 抖音音频转写：`integration/douyin_audio_transcriber.py`（下载视频→ffmpeg抽取压缩MP3→音频转写→回写 `raw_json.stt_text`）

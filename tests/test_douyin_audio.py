@@ -211,6 +211,10 @@ class DouyinAudioUnitTests(unittest.TestCase):
             "export/media/Q0001/Q0001_L001_7537676583709068584.mp3",
         )
 
+    @patch(
+        "integration.douyin_audio_transcriber._ffprobe_container_valid",
+        return_value=(True, ""),
+    )
     @patch("integration.douyin_audio_transcriber.oss_upload")
     @patch("integration.douyin_audio_transcriber.transcribe_with_seedasr_v2")
     @patch("integration.douyin_audio_transcriber.extract_compress_audio")
@@ -221,6 +225,7 @@ class DouyinAudioUnitTests(unittest.TestCase):
         mock_extract_audio,
         mock_transcribe,
         mock_oss_upload,
+        _mock_ffprobe,
     ):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -259,6 +264,10 @@ class DouyinAudioUnitTests(unittest.TestCase):
                 self.assertIn("oss.example.com", result["audio_path"])
                 self.assertIn("oss.example.com", result["video_path"])
 
+    @patch(
+        "integration.douyin_audio_transcriber._ffprobe_container_valid",
+        return_value=(True, ""),
+    )
     @patch("integration.douyin_audio_transcriber.oss_upload")
     @patch("integration.douyin_audio_transcriber.transcribe_with_seedasr_v2")
     @patch("integration.douyin_audio_transcriber.extract_compress_audio")
@@ -269,6 +278,7 @@ class DouyinAudioUnitTests(unittest.TestCase):
         mock_extract_audio,
         mock_transcribe,
         mock_oss_upload,
+        _mock_ffprobe,
     ):
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -299,6 +309,10 @@ class DouyinAudioUnitTests(unittest.TestCase):
                 self.assertEqual(result["stt_text"], "兜底文案")
                 self.assertEqual(result["transcript_model"], "raw_text_fallback")
 
+    @patch(
+        "integration.douyin_audio_transcriber._ffprobe_container_valid",
+        return_value=(True, ""),
+    )
     @patch("integration.douyin_audio_transcriber.oss_upload")
     @patch("integration.douyin_audio_transcriber.transcribe_with_seedasr_v2")
     @patch("integration.douyin_audio_transcriber.extract_compress_audio")
@@ -309,6 +323,7 @@ class DouyinAudioUnitTests(unittest.TestCase):
         mock_extract_audio,
         mock_transcribe,
         mock_oss_upload,
+        _mock_ffprobe,
     ):
         """ASR 报静音/无口播且页面有足够文本时：done + text_content_bgm_no_asr + parse_note。"""
         with tempfile.TemporaryDirectory() as td:

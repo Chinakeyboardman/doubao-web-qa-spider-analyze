@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -43,6 +44,10 @@ logger = logging.getLogger(__name__)
 DOUBAO_URL = "https://www.doubao.com/chat/"
 STATE_DIR = Path(__file__).parent / ".browser_state"
 QUERY_INTERVAL = 60
+# 正文停止变化后，参考资料/思考块可能仍在渲染；再等待一段时间再抽链接（毫秒，0=关闭）
+_POST_ANSWER_SETTLE_MS = max(0, int(os.getenv("DOUBAO_WEB_POST_ANSWER_SETTLE_MS", "8000")))
+# 首次抽链接为空时，再等待并重试一轮（毫秒，0=关闭；用于排查「DOM 晚于正文」）
+_CITATION_RETRY_MS = max(0, int(os.getenv("DOUBAO_WEB_CITATION_RETRY_MS", "0")))
 
 _URL_RE = re.compile(r"https?://[^\s\])'\"<>]+")
 _sms_cfg = CONFIG["sms_api"]
@@ -446,15 +451,39 @@ class DoubaoWebCollector:
                     "Please run: python integration/run.py web-login --manual"
                 )
             await self._ensure_default_chat_ready()
-            await self._switch_to_think_mode()
+            think_ok = await self._switch_to_think_mode()
+            if not think_ok:
+                logger.error(
+                    "[collect] 未能切换到「思考」模式，本次回答很可能无参考资料链接；"
+                    "请用有头浏览器检查豆包是否改版（模式按钮文案/位置）。query_id=%s",
+                    query_id,
+                )
             await self._send_message(query_text)
             await self._wait_until_done()
+
+            if _POST_ANSWER_SETTLE_MS > 0:
+                logger.info(
+                    "[collect] post-answer settle %dms before citation extract (query=%s)",
+                    _POST_ANSWER_SETTLE_MS,
+                    query_id,
+                )
+                await self._page.wait_for_timeout(_POST_ANSWER_SETTLE_MS)
 
             answer_text = await self._get_answer_text()
             deep_links = await self._click_and_extract_deep_thinking()
             inline_links = await self._get_answer_inline_links()
 
             all_links = _merge_links(deep_links, inline_links)
+            if len(all_links) == 0 and _CITATION_RETRY_MS > 0:
+                logger.warning(
+                    "[collect] zero citation links, retrying after %dms (query=%s)",
+                    _CITATION_RETRY_MS,
+                    query_id,
+                )
+                await self._page.wait_for_timeout(_CITATION_RETRY_MS)
+                deep_links = await self._click_and_extract_deep_thinking()
+                inline_links = await self._get_answer_inline_links()
+                all_links = _merge_links(deep_links, inline_links)
             if not (answer_text or "").strip():
                 raise RuntimeError(
                     "Empty answer captured from Doubao web; likely login/session/captcha/network issue."
@@ -677,26 +706,75 @@ class DoubaoWebCollector:
             "possible causes: not selected default conversation, login modal, or captcha overlay."
         )
 
-    async def _switch_to_think_mode(self):
-        """Switch to '思考' mode (enables web search + deep thinking)."""
+    async def _switch_to_think_mode(self) -> bool:
+        """Switch to '思考' mode (enables web search + deep thinking).
+
+        豆包会改版：入口可能是「快速/极速/自动」等 + 下拉里的「思考/深度思考」。
+        若切换失败，模型可能停留在非联网思考模式，导致回答无参考资料链接。
+        """
         page = self._page
-        mode_btn = page.locator('button:has-text("快速")')
-        if await mode_btn.count() > 0:
-            await mode_btn.first.click()
-            await page.wait_for_timeout(1000)
-            think_opt = page.locator('text=思考')
+        # 1) 打开模式菜单（文案随版本变化）
+        for open_label in ("快速", "极速", "自动", "默认"):
+            mode_btn = page.locator(f'button:has-text("{open_label}")')
+            if await mode_btn.count() > 0:
+                try:
+                    await mode_btn.first.click()
+                    await page.wait_for_timeout(800)
+                    logger.info("Opened model/mode menu via button: %s", open_label)
+                    break
+                except Exception as e:
+                    logger.debug("Open mode menu (%s): %s", open_label, e)
+
+        # 2) 选择「深度思考」或「思考」（优先长的，避免点到「思考中」等片段）
+        for opt_text in ("深度思考", "思考"):
+            for sel in (
+                f'[role="menuitem"]:has-text("{opt_text}")',
+                f'[role="option"]:has-text("{opt_text}")',
+                f'div[role="button"]:has-text("{opt_text}")',
+            ):
+                loc = page.locator(sel)
+                for i in range(await loc.count()):
+                    try:
+                        el = loc.nth(i)
+                        if await el.is_visible():
+                            await el.click()
+                            logger.info("Switched to %s via %s", opt_text, sel)
+                            await page.wait_for_timeout(1200)
+                            return True
+                    except Exception:
+                        continue
+            think_opt = page.locator(f"text={opt_text}")
             for i in range(await think_opt.count()):
-                if await think_opt.nth(i).is_visible():
-                    await think_opt.nth(i).click()
-                    logger.info("Switched to 思考 mode")
-                    await page.wait_for_timeout(1000)
-                    return True
-        # Already in 思考 mode or button text differs
-        think_btn = page.locator('button:has-text("思考")')
-        if await think_btn.count() > 0:
-            logger.info("Already in 思考 mode")
-            return True
-        logger.warning("Could not switch to 思考 mode, using default")
+                try:
+                    el = think_opt.nth(i)
+                    if await el.is_visible():
+                        await el.click()
+                        logger.info("Switched to %s (text locator)", opt_text)
+                        await page.wait_for_timeout(1200)
+                        return True
+                except Exception:
+                    continue
+
+        # 3) 可能已在思考模式：工具栏上直接显示「思考」类按钮
+        for sel in (
+            'button:has-text("深度思考")',
+            'button:has-text("思考")',
+            '[class*="think"]:has-text("思考")',
+        ):
+            think_btn = page.locator(sel)
+            if await think_btn.count() > 0:
+                try:
+                    txt = (await think_btn.first.inner_text()).strip()
+                    if len(txt) <= 12 and "思考" in txt:
+                        logger.info("Think mode already indicated by UI: %s", txt[:40])
+                        return True
+                except Exception:
+                    pass
+
+        logger.warning(
+            "Could not switch to 思考/深度思考 mode — Doubao UI may have changed. "
+            "Try web-login --manual in headed mode and inspect the mode selector."
+        )
         return False
 
     async def _send_message(self, text: str):
@@ -913,66 +991,254 @@ class DoubaoWebCollector:
     # ------------------------------------------------------------------
     # Deep-thinking link extraction (the key feature)
     # ------------------------------------------------------------------
-    async def _extract_deep_thinking_links_js(self, page) -> list[dict]:
-        """从参考资料侧栏/思考块等 DOM 中抽取外链；选择器兼容豆包多版本与 class 哈希。"""
-        links: list[dict] = await page.evaluate("""() => {
-            const results = [];
-            const seen = new Set();
-            const skipDomains = ['doubao.com', 'volces.com', 'bytedance.com', 'byteimg.com', 'feishu.cn', 'javascript:'];
-            const isOk = (url) => url && url.startsWith('http') && !skipDomains.some(d => url.includes(d));
+    _UNIFIED_CITATION_JS = r"""() => {
+        const results = [];
+        const seen = new Set();
+        const skipSubstrings = [
+            'doubao.com', 'volces.com', 'bytedance.com', 'byteimg.com', 'byteacctimg.com',
+            'feishu.cn', 'p3-passport', 'passport', 'w3.org', 'schema.org',
+            'lf-flow-web-cdn', 'javascript:', 'localhost',
+        ];
+        const isOkUrl = (raw) => {
+            if (!raw || typeof raw !== 'string') return false;
+            let u = raw.trim();
+            if (u.startsWith('//')) u = 'https:' + u;
+            if (!u.startsWith('http')) return false;
+            const low = u.toLowerCase();
+            return !skipSubstrings.some(s => low.includes(s));
+        };
+        const norm = (raw) => {
+            let u = (raw || '').trim();
+            if (u.startsWith('//')) u = 'https:' + u;
+            return u;
+        };
+        const push = (url, title, source) => {
+            const u = norm(url);
+            if (!isOkUrl(u) || seen.has(u)) return;
+            seen.add(u);
+            results.push({ url: u, title: (title || '').slice(0, 300), source: source });
+        };
 
-            function collectFromRoot(root) {
-                if (!root || !root.querySelectorAll) return;
-                root.querySelectorAll('a[href^="http"]').forEach(a => {
-                    const url = (a.href || '').trim();
-                    if (!isOk(url) || seen.has(url)) return;
-                    seen.add(url);
-                    results.push({
-                        url: url,
-                        title: (a.textContent || '').trim().slice(0, 300),
-                        source: 'deep_thinking',
-                    });
-                });
+        function isInLeftNav(el) {
+            let p = el;
+            for (let i = 0; i < 32 && p; i++) {
+                const dt = p.getAttribute && p.getAttribute('data-testid');
+                if (dt === 'chat_list_thread_item' || dt === 'create_conversation_button'
+                    || dt === 'skill-page-item-more' || (dt && dt.indexOf('skill-page-item') === 0)) {
+                    return true;
+                }
+                const cls = (p.className && String(p.className)) || '';
+                const id = p.id || '';
+                if (/^conversation_\\d+$/.test(id)) return true;
+                if (/nav-link|chat-item-r|chat_list|history对话|sidebar_nav/i.test(cls)) {
+                    try {
+                        const r = p.getBoundingClientRect();
+                        if (r.left < (window.innerWidth * 0.32) && r.width < 520) return true;
+                    } catch (e) {}
+                }
+                p = p.parentElement;
             }
+            return false;
+        }
 
-            // 1) 从可能的参考资料/思考/侧栏容器中取链接（豆包 class 可能含 think/search/reference/drawer/panel 等）
-            const containerSelectors = [
-                '[class*="think"]', '[class*="deep"]', '[class*="search"]',
-                '[class*="reference"]', '[class*="ref"]', '[class*="source"]',
-                '[class*="citation"]', '[class*="collapse"]', '[class*="flow"]',
-                '[class*="reasoning"]', '[class*="process"]',
-                '[class*="drawer"]', '[class*="sidebar"]', '[class*="panel"]',
-                '[class*="modal"]', '[class*="popover"]', '[class*="overlay"]',
-                '[class*="link"]', '[class*="url"]', '[class*="content"]',
-                'details[open]', '[role="dialog"]', '[aria-label*="参考"]', '[aria-label*="资料"]',
-            ];
-            for (const sel of containerSelectors) {
-                try {
-                    document.querySelectorAll(sel).forEach(collectFromRoot);
-                } catch (e) {}
-            }
-
-                // 2) 从包含「参考」「资料」等文案的节点子树中取链接（结构未知时兜底）
-            const walk = (node) => {
-                if (!node) return;
-                const text = (node.innerText || '').slice(0, 200);
-                if ((/参考|资料|来源|引用|搜索.*关键词/).test(text))
-                    collectFromRoot(node);
-                for (const child of node.children || []) walk(child);
-            };
-            walk(document.body);
-
-            // 3) 若有 iframe，尝试从其 document 抽取
-            document.querySelectorAll('iframe').forEach(iframe => {
-                try {
-                    const doc = iframe.contentDocument || iframe.contentWindow?.document;
-                    if (doc && doc.body) collectFromRoot(doc.body);
-                } catch (e) {}
+        function collectAnchors(root, source, filterNav) {
+            if (!root || !root.querySelectorAll) return;
+            root.querySelectorAll('a[href]').forEach((a) => {
+                if (filterNav && isInLeftNav(a)) return;
+                const href = a.getAttribute('href') || '';
+                let u = a.href || href;
+                if (href.startsWith('//')) u = 'https:' + href;
+                push(u, (a.textContent || '').trim(), source);
             });
+        }
 
-            return results;
-        }""")
-        return links
+        function collectShadowRoots(root, depth) {
+            if (!root || depth > 10) return;
+            try {
+                root.querySelectorAll('*').forEach((el) => {
+                    if (el.shadowRoot) {
+                        collectAnchors(el.shadowRoot, 'shadow', false);
+                        collectShadowRoots(el.shadowRoot, depth + 1);
+                    }
+                });
+            } catch (e) {}
+        }
+
+        // --- A) 旧版 + 新版参考资料区（含 search-reference-ui-v3 展开后的面板）---
+        const legacySelectors = [
+            '[data-testid="search-reference-ui-v3"]',
+            '[data-testid*="search-reference"]', '[data-testid*="reference-ui"]',
+            '[class*="entry-btn-v3"]',
+            '[class*="think"]', '[class*="deep"]', '[class*="search"]',
+            '[class*="reference"]', '[class*="ref"]', '[class*="source"]',
+            '[class*="citation"]', '[class*="collapse"]', '[class*="flow"]',
+            '[class*="reasoning"]', '[class*="process"]',
+            '[class*="drawer"]', '[class*="panel"]', '[class*="modal"]',
+            'details[open]', '[role="dialog"]', '[aria-label*="参考"]', '[aria-label*="资料"]',
+        ];
+        legacySelectors.forEach((sel) => {
+            try {
+                document.querySelectorAll(sel).forEach((el) => collectAnchors(el, 'legacy_container', false));
+            } catch (e) {}
+        });
+
+        // --- B) 新版：主对话区（markdown / 消息气泡），排除左侧会话列表 ---
+        const chatRoots = [
+            '[class*="markdown-body"]', '[class*="flow-markdown"]', '[class*="message-content"]',
+            '[class*="table-wrapper"]', '[data-foundation-type*="receive"]',
+            '[class*="receive-message"]', '[class*="suggest-message"]',
+        ];
+        chatRoots.forEach((sel) => {
+            try {
+                document.querySelectorAll(sel).forEach((el) => collectAnchors(el, 'chat_scoped', true));
+            } catch (e) {}
+        });
+
+        // --- C) 全页 <a>（过滤左侧导航），兼容仅出现在主区域的新 class ---
+        document.querySelectorAll('a[href]').forEach((a) => {
+            if (isInLeftNav(a)) return;
+            const href = a.getAttribute('href') || '';
+            let u = a.href || href;
+            if (href.startsWith('//')) u = 'https:' + href;
+            push(u, (a.textContent || '').trim(), 'page_anchor_filtered');
+        });
+
+        // --- D) data-* 外链（新版组件） ---
+        document.querySelectorAll('[data-url], [data-href], [data-link], [data-source-url]').forEach((el) => {
+            if (isInLeftNav(el)) return;
+            const raw = el.getAttribute('data-url') || el.getAttribute('data-href')
+                || el.getAttribute('data-link') || el.getAttribute('data-source-url') || '';
+            push(raw, (el.textContent || '').trim(), 'data_attr');
+        });
+
+        // --- E) iframe 内文档 ---
+        document.querySelectorAll('iframe').forEach((iframe) => {
+            try {
+                const doc = iframe.contentDocument || iframe.contentWindow && iframe.contentWindow.document;
+                if (doc && doc.body) collectAnchors(doc.body, 'iframe', false);
+            } catch (e) {}
+        });
+
+        // --- F) Shadow DOM（仅扫 shadow 内，避免与全页重复）---
+        collectShadowRoots(document.body, 0);
+
+        // --- G) 正文正则兜底（纯文本 URL、未包在 <a> 内）---
+        const bodyText = (document.body && document.body.innerText) || '';
+        const tail = bodyText.slice(Math.max(0, bodyText.length - 80000));
+        const urlRe = new RegExp('https?:\\/\\/[^\\s<>]+', 'g');
+        let m;
+        while ((m = urlRe.exec(tail)) !== null) {
+            let u = m[0].replace(/[.,;:!?)\\]}>'"]+$/g, '');
+            push(u, '', 'body_regex');
+        }
+
+        return results;
+    }"""
+
+    async def _extract_unified_citation_links_js(self, page) -> list[dict]:
+        """统一抽取：旧版容器 + 新版主对话区 + 侧栏过滤 + data-* + iframe/shadow + 正文 URL 正则。"""
+        try:
+            raw = await page.evaluate(self._UNIFIED_CITATION_JS)
+            if isinstance(raw, list) and raw:
+                logger.info("Unified citation extract: %d raw link(s)", len(raw))
+            elif isinstance(raw, list) and not raw:
+                try:
+                    diag = await page.evaluate("""() => {
+                        const allA = document.querySelectorAll('a[href]').length;
+                        const httpA = document.querySelectorAll('a[href^="http"]').length;
+                        const bt = ((document.body && document.body.innerText) || '').length;
+                        return { allA, httpA, bodyTextLen: bt };
+                    }""")
+                    logger.info("Unified citation extract empty; DOM diag=%s", diag)
+                except Exception:
+                    pass
+            return raw if isinstance(raw, list) else []
+        except Exception as exc:
+            logger.warning("Unified citation extract failed: %s", exc)
+            return []
+
+    async def _extract_deep_thinking_links_js(self, page) -> list[dict]:
+        """兼容：内部转调统一抽取（保留函数名供测试与日志）。"""
+        return await self._extract_unified_citation_links_js(page)
+
+    async def _expand_thinking_ui_panels(self) -> None:
+        """豆包改版后「思考/参考」可能用新 class；尝试展开折叠块再抽链接。"""
+        page = self._page
+        # 0) 新版参考资料入口 v3：点击「参考 N 篇资料」展开外链（用户确认 DOM）
+        #    <div data-testid="search-reference-ui-v3" class="entry-btn-v3-...">...</div>
+        try:
+            ref = page.locator('[data-testid="search-reference-ui-v3"]')
+            for i in range(await ref.count()):
+                try:
+                    el = ref.nth(i)
+                    if not await el.is_visible():
+                        continue
+                    await el.click()
+                    logger.info(
+                        "Clicked search-reference-ui-v3 to expand references (idx=%d)",
+                        i,
+                    )
+                    await page.wait_for_timeout(2200)
+                    break
+                except Exception:
+                    continue
+            else:
+                # class 带哈希会变，用稳定子串 + 文案
+                fb = page.locator('[class*="entry-btn-v3"]')
+                for j in range(min(await fb.count(), 8)):
+                    try:
+                        el = fb.nth(j)
+                        if not await el.is_visible():
+                            continue
+                        txt = (await el.inner_text()).strip()
+                        if "参考" in txt and "篇" in txt and "资料" in txt:
+                            await el.click()
+                            logger.info(
+                                "Clicked entry-btn-v3 reference control: %s",
+                                txt[:80],
+                            )
+                            await page.wait_for_timeout(2200)
+                            break
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logger.debug("search-reference-ui-v3 / entry-btn-v3: %s", exc)
+
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        await page.wait_for_timeout(400)
+        try:
+            clicked = await page.evaluate("""() => {
+                const out = [];
+                let clicks = 0;
+                const seenText = new Set();
+                const sel = 'button, [role="button"], [class*="collapse"], [class*="think"], '
+                    + 'div[class*="cursor-pointer"], span[class*="cursor-pointer"]';
+                document.querySelectorAll(sel).forEach((el) => {
+                    if (clicks >= 8) return;
+                    const t = (el.innerText || '').trim();
+                    if (t.length > 100 || t.length < 2) return;
+                    // 勿点纯「思考」易与输入区模式切换冲突；勿重复点同一文案
+                    if (/^思考$|^深度思考$/.test(t)) return;
+                    if (!/(已完成|参考|篇|资料|展开|查看|搜索.*关键词)/.test(t)) return;
+                    const key = t.slice(0, 40);
+                    if (seenText.has(key)) return;
+                    seenText.add(key);
+                    try {
+                        el.click();
+                        out.push(t.slice(0, 80));
+                        clicks += 1;
+                    } catch (e) {}
+                });
+                return out;
+            }""")
+            if clicked:
+                logger.info("expand_thinking_ui_panels clicked %d control(s): %s", len(clicked), clicked[:5])
+        except Exception as exc:
+            logger.debug("expand_thinking_ui_panels: %s", exc)
+        await page.wait_for_timeout(1500)
 
     async def _click_and_extract_deep_thinking(self) -> list[dict]:
         """Expand 深度思考 section and collect links step-by-step with dedupe."""
@@ -981,7 +1247,7 @@ class DoubaoWebCollector:
 
         async def collect_once(stage: str) -> int:
             nonlocal merged_links
-            links = await self._extract_deep_thinking_links_js(page)
+            links = await self._extract_unified_citation_links_js(page)
             if not links:
                 links = await self._extract_urls_from_thinking_text()
             if links:
@@ -991,6 +1257,10 @@ class DoubaoWebCollector:
                 logger.info("Deep-thinking collect@%s: +%d (total=%d)", stage, delta, len(merged_links))
                 return delta
             return 0
+
+        # 含 search-reference-ui-v3 点击；展开后立刻抽一轮
+        await self._expand_thinking_ui_panels()
+        await collect_once("after_expand_panels")
 
         # 1) Expand main thinking block ("已完成思考，参考 N 篇资料")
         collapse_btn = page.locator("[class*='collapse-collapse-button'], [class*='think-block-title']")
@@ -1005,6 +1275,25 @@ class DoubaoWebCollector:
                     break
             except Exception:
                 continue
+
+        # 1b) 新版 UI：仅点「参考/篇/资料」类展开，避免重复点「已完成思考」导致折叠
+        try:
+            for pat in (r"参考\s*\d+\s*篇", r"篇资料", r"查看.*资料", r"资料来源"):
+                loc = page.get_by_text(re.compile(pat))
+                n = await loc.count()
+                for i in range(min(n, 2)):
+                    try:
+                        el = loc.nth(i)
+                        if not await el.is_visible():
+                            continue
+                        await el.click()
+                        logger.info("Clicked new-UI ref pattern %s (idx=%d)", pat, i)
+                        await page.wait_for_timeout(1200)
+                        await collect_once(f"playwright_ref_{i}")
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logger.debug("playwright ref expand: %s", exc)
 
         # 2) Click each "搜索 x 个关键词" step and collect immediately.
         # Run multi-round scan because new step buttons can appear after previous clicks.
@@ -1041,14 +1330,8 @@ class DoubaoWebCollector:
             if not progressed:
                 break
 
-        # 3) Always do one full-page pass to reduce omission risk for dynamic DOM.
-        page_links = await self._extract_all_page_links()
-        if page_links:
-            before = len(merged_links)
-            merged_links = _merge_unique_links(merged_links, page_links)
-            delta = len(merged_links) - before
-            if delta > 0:
-                logger.info("Final page scan added %d links", delta)
+        # 3) 最后再跑一轮统一抽取（点击步骤后 DOM 可能才挂出 <a>）
+        await collect_once("after_all_interactions")
 
         # 4) Fallback dump only if still empty.
         if not merged_links:
@@ -1068,13 +1351,19 @@ class DoubaoWebCollector:
             const sels = [
                 '[class*="think"]', '[class*="deep"]', '[class*="search"]',
                 '[class*="reasoning"]', '[class*="process"]',
-                '[class*="flow"]', 'details[open]',
+                '[class*="flow"]', '[class*="markdown"]', '[class*="message-content"]',
+                '[class*="table-wrapper"]', '[data-foundation-type*="receive"]',
+                'details[open]', 'main', '#root',
             ];
             for (const s of sels) {
-                document.querySelectorAll(s).forEach(el => {
-                    t.push(el.innerText || '');
-                });
+                try {
+                    document.querySelectorAll(s).forEach(el => {
+                        t.push(el.innerText || '');
+                    });
+                } catch (e) {}
             }
+            const bt = (document.body && document.body.innerText) || '';
+            if (bt) t.push(bt.slice(Math.max(0, bt.length - 120000)));
             return t;
         }""")
         seen: set[str] = set()
@@ -1114,25 +1403,30 @@ class DoubaoWebCollector:
         return links
 
     async def _get_answer_inline_links(self) -> list[dict]:
-        """Links embedded in the answer text itself (citation links)."""
+        """Links embedded in the answer区（旧版 markdown-body + 新版 flow-markdown 等）。"""
         links: list[dict] = await self._page.evaluate("""() => {
             const results = [];
             const seen = new Set();
+            const skip = ['doubao.com', 'volces.com', 'bytedance.com', 'byteimg.com', 'feishu.cn'];
+            const ok = (u) => u && u.startsWith('http') && !skip.some(d => u.includes(d));
             document.querySelectorAll(
                 '.markdown-body a[href], '
+                + '[class*="flow-markdown"] a[href], '
+                + '[class*="message-content"] a[href], '
                 + '[class*="answer"] a[href], '
-                + '[class*="message-content"] a[href]'
+                + '[class*="table-wrapper"] a[href], '
+                + '[data-foundation-type*="receive"] a[href]'
             ).forEach(a => {
-                const url = a.href;
-                if (url && url.startsWith('http') && !seen.has(url)
-                    && !url.includes('doubao.com')) {
-                    seen.add(url);
-                    results.push({
-                        url: url,
-                        title: (a.textContent || '').trim().slice(0, 300),
-                        source: 'answer_inline',
-                    });
-                }
+                let u = a.href || '';
+                const h = a.getAttribute('href') || '';
+                if (h.startsWith('//')) u = 'https:' + h;
+                if (!ok(u) || seen.has(u)) return;
+                seen.add(u);
+                results.push({
+                    url: u,
+                    title: (a.textContent || '').trim().slice(0, 300),
+                    source: 'answer_inline',
+                });
             });
             return results;
         }""")

@@ -24,8 +24,12 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _EXPORT_ROOT = _PROJECT_ROOT / "export"
-_MEDIA_DIR = _EXPORT_ROOT / "media"
 _DEFAULT_API_BASE = CONFIG.get("douyin_api", {}).get("url", "http://localhost:8081")
+
+
+def _media_dir() -> Path:
+    """与 export/media 一致；随 _EXPORT_ROOT 补丁变化（单测隔离本地目录）。"""
+    return _EXPORT_ROOT / "media"
 
 _MAX_PROMPT_AUDIO_CHARS = int(os.getenv("DOUYIN_AUDIO_MAX_TRANSCRIPT_CHARS", "6000"))
 _ASR_TIMEOUT_SECONDS = int(os.getenv("VOLCENGINE_ASR_TIMEOUT_SECONDS", "300"))
@@ -223,6 +227,42 @@ def _ffprobe_audio_stream_count(video_path: Path) -> int:
         return -1
     lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
     return len(lines)
+
+
+def _ffprobe_container_valid(video_path: Path) -> tuple[bool, str]:
+    """检查文件是否为可读媒体（能解析 format duration）。
+
+    用于尽早发现「moov atom not found」、截断下载、HTML 误存为 mp4 等，避免 ffmpeg 反复失败刷屏。
+    若系统无 ffprobe，返回 (True, '') 不阻拦后续逻辑。
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        return True, ""
+    except subprocess.TimeoutExpired:
+        return False, "ffprobe timeout (120s)"
+    err = (proc.stderr or "").strip()
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        tail = err[-2000:] if len(err) > 2000 else err
+        return False, tail or f"ffprobe exit {proc.returncode}"
+    try:
+        duration = float(out.split()[0])
+    except (ValueError, IndexError):
+        return False, f"bad duration output: {out!r}"
+    if duration <= 0:
+        return False, f"zero or negative duration: {duration}"
+    return True, ""
 
 
 def _ffmpeg_error_snippet(proc: subprocess.CompletedProcess, *, max_chars: int = 3000) -> str:
@@ -526,6 +566,17 @@ def _file_basename(link_id: str, link_url: str, raw: dict) -> str:
     return link_id
 
 
+def _unlink_local_media_after_oss(video_path: Path, audio_path: Path, link_id: str) -> None:
+    """OSS 已成功上传后删除本地 mp4/mp3，节省磁盘；后续 SeedASR 仅使用 OSS URL。"""
+    for p in (video_path, audio_path):
+        try:
+            if p.is_file():
+                p.unlink()
+                logger.debug("[audio] %s removed local after OSS upload: %s", link_id, p)
+        except OSError as e:
+            logger.warning("[audio] %s could not remove local file %s: %s", link_id, p, e)
+
+
 def process_one(
     link_id: str,
     query_id: str,
@@ -543,22 +594,44 @@ def process_one(
         return {"skipped": True, "reason": "missing_link_url"}
 
     file_basename = _file_basename(link_id, link_url, raw)
-    out_dir = _MEDIA_DIR / query_id
+    out_dir = _media_dir() / query_id
     out_dir.mkdir(parents=True, exist_ok=True)
     video_path = out_dir / f"{file_basename}.mp4"
     audio_path = out_dir / f"{file_basename}.mp3"
 
-    # 1) 下载视频
+    # 1) 下载视频（缓存 mp4 若 ffprobe 不可读则删后重下）
     if not video_path.exists() or video_path.stat().st_size == 0:
         download_video(link_url, api_base, video_path)
+    else:
+        ok_cached, reason_cached = _ffprobe_container_valid(video_path)
+        if not ok_cached:
+            logger.warning(
+                "[audio] %s cached mp4 failed ffprobe, re-downloading: %s",
+                link_id,
+                reason_cached[:500],
+            )
+            try:
+                video_path.unlink()
+            except OSError:
+                pass
+            download_video(link_url, api_base, video_path)
+
+    ok_v, reason_v = _ffprobe_container_valid(video_path)
+    if not ok_v:
+        raise RuntimeError(
+            "downloaded video is not a valid media file (ffprobe). "
+            "Common causes: incomplete download, moov atom missing, or non-video body saved as .mp4. "
+            f"Details: {reason_v[:1500]}"
+        )
 
     # 2) 用 ffmpeg 抽取 mp3
     if not audio_path.exists() or audio_path.stat().st_size == 0:
         extract_compress_audio(video_path, audio_path)
 
-    # 3) 上传到 OSS
+    # 3) 上传到 OSS（成功后删本地，转写只依赖 OSS URL）
     video_oss_url = oss_upload(video_path, _oss_key_for(query_id, file_basename, "mp4"))
     audio_oss_url = oss_upload(audio_path, _oss_key_for(query_id, file_basename, "mp3"))
+    _unlink_local_media_after_oss(video_path, audio_path, link_id)
 
     # 4) SeedASR 2.0 转写
     transcript = ""

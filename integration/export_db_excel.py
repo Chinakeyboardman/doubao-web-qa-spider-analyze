@@ -34,6 +34,16 @@ CORE_TABLES: list[tuple[str, str, str]] = [
 ]
 
 
+def _meta_column_name(row: dict[str, Any]) -> str:
+    """information_schema 在 PG/MySQL 下字段名大小写可能不同。"""
+    return str(
+        row.get("column_name")
+        or row.get("COLUMN_NAME")
+        or row.get("Column_name")
+        or ""
+    )
+
+
 def normalize_value(value: Any) -> Any:
     """Convert DB values into Excel-friendly values."""
     if value is None:
@@ -63,13 +73,18 @@ def export_table(
 
     meta_cur = backend.get_dict_cursor(conn)
     try:
-        schema_filter = "table_schema = 'public' AND " if backend.dialect() == "postgresql" else ""
+        if backend.dialect() == "postgresql":
+            schema_filter = "table_schema = 'public' AND "
+        elif backend.dialect() == "mysql":
+            schema_filter = "table_schema = DATABASE() AND "
+        else:
+            schema_filter = ""
         meta_cur.execute(
             f"SELECT column_name FROM information_schema.columns "
             f"WHERE {schema_filter}table_name = %s ORDER BY ordinal_position",
             (table_name,),
         )
-        columns = [row["column_name"] for row in meta_cur.fetchall()]
+        columns = [c for c in (_meta_column_name(r) for r in meta_cur.fetchall()) if c]
     finally:
         meta_cur.close()
 
