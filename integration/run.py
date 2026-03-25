@@ -13,6 +13,7 @@ Usage:
     python integration/run.py enrich-douyin                     # 从 douyin_videos/comments 补全抖音数据
     python integration/run.py audio-transcribe                 # 抖音视频下载+音频转写（Step 2.6）
     python integration/run.py structure / status / retry
+    python integration/run.py validate-content-json [--apply]   # 非法 content_json → error 并清空，再 structure
     python integration/run.py regenerate-content           # 根据链接重新生成 qa_link_content（按文档规范）
     python integration/run.py export                            # 导出报告+完整数据到 export/（JSON + MD）
     python integration/run.py export-excel                      # 导出5张QA表到 XLSX
@@ -132,7 +133,7 @@ def _preflight_dependencies(command: str) -> bool:
     db_required = {
         "run", "collect", "crawl", "enrich-douyin", "audio-transcribe", "audio-bgm-text-done", "structure",
         "regenerate-content", "status", "retry", "recollect", "recollect-web-only",
-        "run-until", "run-sync", "export", "export-excel", "web-collect",
+        "run-until", "run-sync", "export", "export-excel", "web-collect", "validate-content-json",
     }
     douyin_api_required = {"audio-transcribe", "run-sync"}
     douyin_api_optional = {"run", "crawl"}
@@ -252,6 +253,20 @@ def cmd_range_status(args):
     """Show status for query_id range (queries/links/video counters)."""
     snap = _range_status_snapshot(args.start, args.end)
     print(json.dumps(snap, indent=2, ensure_ascii=False))
+
+
+def cmd_validate_content_json(args):
+    """扫描 content_json，不合规则清空并标记 error，便于 structure 重跑。"""
+    from integration.mark_invalid_content_json import run_mark
+
+    lids = [x.strip() for x in (getattr(args, "link_ids", "") or "").split(",") if x.strip()]
+    run_mark(
+        apply=getattr(args, "apply", False),
+        require_dict_root=not getattr(args, "no_require_dict", False),
+        allow_root_array=getattr(args, "allow_root_array", False),
+        batch_size=max(1, int(getattr(args, "batch_size", 500))),
+        link_ids=lids or None,
+    )
 
 
 def cmd_retry(args):
@@ -659,8 +674,24 @@ def cmd_run_sync(args):
         idle_rounds = 0
         _prev_status = None
         _same_count = 0
+        _db_fail_count = 0
         while True:
-            snap = _range_status_snapshot(start_id, end_id)
+            try:
+                snap = _range_status_snapshot(start_id, end_id)
+                _db_fail_count = 0
+            except Exception as e:
+                _db_fail_count += 1
+                logger.warning(
+                    "[sync][monitor] DB query failed (%d consecutive), will retry: %s",
+                    _db_fail_count, e,
+                )
+                if _db_fail_count >= 30:
+                    logger.error("[sync][monitor] DB unreachable for %d rounds, aborting.", _db_fail_count)
+                    for t in tasks:
+                        t.cancel()
+                    return
+                await asyncio.sleep(poll)
+                continue
             q = snap["queries"]
             l = snap["links"]
             vd = snap.get("video", {"pending": 0, "processing": 0, "done": 0, "error": 0})
@@ -919,6 +950,25 @@ def main():
     p_range_status.add_argument("--start", required=True, help="起始 query_id")
     p_range_status.add_argument("--end", required=True, help="结束 query_id")
     p_range_status.set_defaults(func=cmd_range_status)
+
+    p_val_cj = sub.add_parser(
+        "validate-content-json",
+        help="扫描 content_json，不合规则清空并标记 error，便于 structure 重跑",
+    )
+    p_val_cj.add_argument("--apply", action="store_true", help="写入：content_json=NULL, status=error")
+    p_val_cj.add_argument(
+        "--allow-root-array",
+        action="store_true",
+        help="允许根节点为 JSON 数组（默认仅允许 object）",
+    )
+    p_val_cj.add_argument(
+        "--no-require-dict",
+        action="store_true",
+        help="不强制根为 dict（仍须为 object 或 array）",
+    )
+    p_val_cj.add_argument("--batch-size", type=int, default=500, help="分页扫描行数")
+    p_val_cj.add_argument("--link-ids", help="逗号分隔 link_id，仅检查这些")
+    p_val_cj.set_defaults(func=cmd_validate_content_json)
 
     p_retry = sub.add_parser("retry", help="Reset failed items to pending")
     p_retry.add_argument(

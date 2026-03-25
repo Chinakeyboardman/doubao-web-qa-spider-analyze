@@ -19,6 +19,7 @@ from shared.config import CONFIG
 from shared.db import execute, fetch_all
 from shared.oss import upload_file as oss_upload, get_public_url as oss_url
 from shared.utils import to_raw_dict, has_meaningful_subtitles, extract_video_id_from_url, resolve_video_id
+from integration.raw_content_postprocess import shrink_json_object_for_storage
 
 logger = logging.getLogger(__name__)
 
@@ -98,12 +99,14 @@ def _truncate_error_for_db(message: str, *, max_len: int = 2000) -> str:
 
 def _parse_download_api_json_error(data: bytes) -> str | None:
     """若响应体为 JSON 错误，返回可读信息。"""
-    if len(data) > 64 * 1024 or not data.strip().startswith(b"{"):
+    if not data or len(data) > 64 * 1024 or not data.strip().startswith(b"{"):
         return None
     try:
         payload = json.loads(data.decode("utf-8", errors="ignore"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return None
+    if not isinstance(payload, dict):
+        return str(payload)[:500] if payload else None
     detail = payload.get("detail")
     if isinstance(detail, dict):
         msg = detail.get("message", str(detail))
@@ -724,7 +727,11 @@ def _set_video_status(
         params_v,
     )
     if video_updated_at and n == 0:
-        logger.warning("[audio] qa_link_video id=%s optimistic lock failed", vid)
+        logger.warning("[audio] qa_link_video id=%s optimistic lock failed, fallback update", vid)
+        execute(
+            f"UPDATE qa_link_video SET status = %s{extra} WHERE id = %s",
+            tuple(params),
+        )
     ol_c = " AND updated_at = %s" if content_updated_at else ""
     params_c = (status, link_id, content_updated_at) if content_updated_at else (status, link_id)
     n = execute(
@@ -732,7 +739,11 @@ def _set_video_status(
         params_c,
     )
     if content_updated_at and n == 0:
-        logger.warning("[audio] qa_link_content %s optimistic lock failed", link_id)
+        logger.warning("[audio] qa_link_content %s optimistic lock failed, fallback update", link_id)
+        execute(
+            "UPDATE qa_link_content SET video_parse_status = %s WHERE link_id = %s",
+            (status, link_id),
+        )
 
 
 def _sync_to_content(
@@ -766,6 +777,8 @@ def _sync_to_content(
         raw["subtitles"] = subtitles
     elif not _has_meaningful_subtitles(raw):
         raw["subtitles"] = [{"start_time": "", "text": stt_text}]
+
+    shrink_json_object_for_storage(raw, link_id=link_id, label="raw_json_audio_sync")
 
     ol_c = " AND updated_at = %s" if content_updated_at else ""
     params_c = (json.dumps(raw, ensure_ascii=False), link_id, content_updated_at) if content_updated_at else (json.dumps(raw, ensure_ascii=False), link_id)

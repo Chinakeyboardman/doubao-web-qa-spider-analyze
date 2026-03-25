@@ -161,6 +161,7 @@ def claim_pending_video_parse_v2(
                 "v.status IN ('pending', 'error')",
                 "l.status = 'done'",
                 "COALESCE(v.stt_text, '') = ''",
+                "COALESCE(v.retry_count, 0) < 3",
                 (
                     "NOT EXISTS ("
                     "  SELECT 1 FROM qa_link_video sib "
