@@ -56,12 +56,15 @@ doubao-web-qa-spider-analyze/
 │   ├── citation_parser.py      # 引用链接解析（URL→平台+格式）
 │   ├── douyin_data_merger.py   # 抖音数据补全（douyin_videos/comments → qa_link_content）
 │   ├── pipeline.py             # 完整流水线编排
-│   └── run.py                  # CLI 入口
+│   ├── mark_invalid_content_json.py  # content_json 合规扫描 + 标记 error 便于重跑 structure
+│   └── run.py                  # CLI 入口（含 validate-content-json）
 ├── web-crawler/                # 多平台链接内容抓取
 │   ├── crawler_manager.py      # 爬虫调度器
 │   └── crawlers/               # 平台爬虫
 │       ├── base.py             # 基类（重试+限频）
-│       ├── generic_web.py      # 通用网页（httpx+BS4）
+│       ├── generic_web.py      # 通用网页（httpx+BS4，DOM+段落降噪）
+│       ├── playwright_web.py   # 通用-JS（Playwright+stealth，头条/什么值得买等）
+│       ├── noise_filter.py     # 按钮/UI 噪声段落过滤（通用双爬虫共用）
 │       ├── douyin_video.py     # 抖音视频（调 8080 API）
 │       ├── bilibili_video.py   # B站视频（调 8080 API）
 │       └── xiaohongshu.py      # 小红书
@@ -321,6 +324,15 @@ doubao-web-qa-spider-analyze/
 - 默认 `DB_TYPE=postgresql`，不配置时行为与改造前完全一致（向后兼容）
 - PG 的 JSONB 自动转 dict，MySQL 的 JSON 返回字符串 → 在 `MySQLBackend.adapt_row()` 统一处理
 - PG `UPDATE ... FROM ...` 语法在 MySQL 需改为 `UPDATE ... JOIN ...`，涉及 `pipeline.py` 中 3 处
+
+#### 4.15 通用爬虫降噪 + MySQL JSON 体积 + content_json 校验（2026-03-24）✅
+
+- [x] **`web-crawler/crawlers/noise_filter.py`**：`is_noise_paragraph()`，子串+正则过滤按钮/分享栏/CSDN 头部拼接/「分钟前 N 人浏览」等 UI 文案，不入 `paragraphs`，减轻后续 LLM 结构化负担
+- [x] **`generic_web.py` / `playwright_web.py`**：`_remove_noise` 扩展分解 `button`/`form`/`select`/`textarea`/`label`、常见 `[role="button"]` 等、`[aria-hidden="true"]`、`.breadcrumb`/`.pagination`/`.share-bar`/`.sidebar` 等；`_extract_paragraphs` 调用 `is_noise_paragraph` 二次过滤
+- [x] **`integration/raw_content_postprocess.py`**：`shrink_json_object_for_storage()`，按 UTF-8 序列化字节收缩嵌套最长字符串；环境变量 **`QA_JSON_MAX_STORAGE_BYTES`**（默认与 raw 6MB 档一致）缓解 MySQL `JSON` + `max_allowed_packet` 写入失败
+- [x] **`integration/pipeline.py`**：`step_structure` / `step_regenerate_content` 写 `content_json` 前调用 shrink
+- [x] **`integration/douyin_audio_transcriber.py`**：`_sync_to_content` 写 `raw_json` 前调用 shrink（长 STT 场景）
+- [x] **`integration/mark_invalid_content_json.py`** + **`run.py validate-content-json`**：扫描 `content_json` 合规性（默认可序列化 + 根为 object）；`--apply` 时 `content_json=NULL` + `status=error`，便于再跑 `structure`（详见 `docs/PIPELINE_DEV_DOC.md`）
 
 ---
 

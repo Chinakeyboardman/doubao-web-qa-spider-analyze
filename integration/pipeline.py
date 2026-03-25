@@ -23,6 +23,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "data-clean"))
 from shared.db import execute, fetch_all, fetch_one
 from shared.sql_builder import sb
 from integration.parsing_routing import use_douyin_download_llm, use_agent_web_summary
+from integration.raw_content_postprocess import shrink_json_object_for_storage
 from integration.douyin_data_merger import (
     DouyinDataMerger,
     _content_quality_score,
@@ -847,6 +848,9 @@ class QAPipeline:
             platform = (r.get("platform") or "").strip()
             structured = self.structurer.structure(raw, content_format, r["link_id"])
             structured = _post_process_by_platform(platform, raw, structured, r["link_id"])
+            structured = shrink_json_object_for_storage(
+                structured, link_id=r["link_id"], label="content_json"
+            )
             execute(
                 "UPDATE qa_link_content "
                 "SET content_json = %s, status = 'done' "
@@ -982,6 +986,9 @@ class QAPipeline:
 
             structured = self.structurer.structure(raw, content_format, link_id)
             structured = _post_process_by_platform(platform, raw, structured, link_id)
+            structured = shrink_json_object_for_storage(
+                structured, link_id=link_id, label="content_json_regen"
+            )
 
             if not force:
                 old_score = _content_quality_score(content)

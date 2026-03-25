@@ -3,12 +3,15 @@
 - 评论：按 digg_count/点赞 降序，最多保留 20 条（与 docs 需求一致）。
 - 正文：当 raw_text+paragraphs 合计过长时，用火山 seed 模型去掉导航/页脚/按钮等噪声，只保留主题相关正文。
 - 硬上限：序列化后约 6MB UTF-8 仍超则截断 raw_text（与 migrate_pg_to_mysql 等场景协调）。
+- 结构化 ``content_json`` / 抖音回写 ``raw_json``：见 ``shrink_json_object_for_storage``，避免 MySQL JSON 列或
+  ``max_allowed_packet`` 导致写入失败。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -19,8 +22,14 @@ _LLM_SANITIZE_TRIGGER_CHARS = 120_000
 _LLM_INPUT_MAX_CHARS = 100_000
 # 模型输出正文软上限
 _LLM_OUTPUT_SOFT_MAX_CHARS = 500_000
-# 整份 raw_json UTF-8 字节硬上限（低于常见 max_allowed_packet 与迁移脚本 7MB 档）
-_RAW_JSON_MAX_BYTES = 6 * 1024 * 1024
+# 单条 JSON 文档（raw / content 等）UTF-8 字节硬上限（低于常见 max_allowed_packet）
+_JSON_STORAGE_MAX_BYTES = max(
+    256 * 1024,
+    int(os.getenv("QA_JSON_MAX_STORAGE_BYTES", str(6 * 1024 * 1024))),
+)
+_RAW_JSON_MAX_BYTES = _JSON_STORAGE_MAX_BYTES
+_TRUNC_SUFFIX = "\n…[已截断以适配 MySQL JSON/包大小上限]"
+_MAX_SHRINK_PASSES = 80
 
 _TOP_COMMENTS_N = 20
 
@@ -143,6 +152,90 @@ def _enforce_max_json_bytes(raw: dict, link_id: str) -> None:
             link_id,
             b,
         )
+
+
+def _json_utf8_byte_length(obj: Any) -> int:
+    try:
+        return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return 1 << 30
+
+
+def _find_longest_string_ref(obj: Any, depth: int = 0) -> tuple[Any, str | int, str] | None:
+    """Locate the longest str value in nested dict/list for in-place truncation."""
+    if depth > 40:
+        return None
+    best: tuple[Any, str | int, str] | None = None
+    best_len = 0
+
+    def consider(parent: Any, key: str | int, val: str) -> None:
+        nonlocal best, best_len
+        if len(val) > best_len:
+            best_len = len(val)
+            best = (parent, key, val)
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                consider(obj, k, v)
+            elif isinstance(v, (dict, list)):
+                sub = _find_longest_string_ref(v, depth + 1)
+                if sub and len(sub[2]) > best_len:
+                    best_len = len(sub[2])
+                    best = sub
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, str):
+                consider(obj, i, v)
+            elif isinstance(v, (dict, list)):
+                sub = _find_longest_string_ref(v, depth + 1)
+                if sub and len(sub[2]) > best_len:
+                    best_len = len(sub[2])
+                    best = sub
+    return best
+
+
+def shrink_json_object_for_storage(
+    obj: Any,
+    *,
+    max_bytes: int | None = None,
+    link_id: str = "?",
+    label: str = "json",
+) -> Any:
+    """将 dict/list 收缩到 UTF-8 序列化后不超过 *max_bytes*（默认 ``QA_JSON_MAX_STORAGE_BYTES``）。
+
+    MySQL JSON 列与单条 SQL 报文受 ``max_allowed_packet`` 限制；LLM 结构化 ``content_json`` 可能极大，
+    需在 ``json.dumps`` 入库前调用。优先截断嵌套中最长的字符串字段，多次迭代直至达标或无法再截断。
+    """
+    max_b = int(max_bytes) if max_bytes is not None else _JSON_STORAGE_MAX_BYTES
+    if not isinstance(obj, (dict, list)):
+        return obj
+    for _pass in range(_MAX_SHRINK_PASSES):
+        if _json_utf8_byte_length(obj) <= max_b:
+            return obj
+        ref = _find_longest_string_ref(obj)
+        if ref is None:
+            break
+        parent, key, val = ref
+        if not isinstance(val, str) or len(val) < 64:
+            break
+        new_len = max(32, len(val) * 2 // 3)
+        parent[key] = val[:new_len] + _TRUNC_SUFFIX
+        logger.warning(
+            "json_storage: truncated long string in %s for %s (pass %d, target max_bytes=%d)",
+            label,
+            link_id,
+            _pass + 1,
+            max_b,
+        )
+    if _json_utf8_byte_length(obj) > max_b:
+        logger.error(
+            "json_storage: still over max_bytes=%d after shrink for %s (%s) — check data",
+            max_b,
+            link_id,
+            label,
+        )
+    return obj
 
 
 def postprocess_raw_for_storage(raw: dict, *, link_id: str = "") -> dict:

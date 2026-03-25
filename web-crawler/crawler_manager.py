@@ -70,9 +70,13 @@ class CrawlerManager:
             return {"url": url, "platform": platform, "skipped": True}
 
         crawler = self.get_crawler(platform)
-        logger.info("Crawling [%s] %s: %s", crawler.platform, link_id, url[:80])
+        logger.info("Crawling [%s] %s: %s", platform or crawler.platform, link_id, url[:80])
 
         result = await crawler.crawl_with_retry(url)
+        # 入库与结构化里的「来源网站」以 qa_link.platform 为准（什么值得买/头条…），
+        # 勿用爬虫类名（如 PlaywrightWebCrawler 的「通用-JS」）。
+        if not result.get("skipped"):
+            result["platform"] = platform
         return result
 
     async def batch_crawl(
@@ -94,15 +98,23 @@ class CrawlerManager:
 
         succeeded: list[str] = []
         sem = asyncio.Semaphore(max(1, int(concurrency or 1)))
+        # 什么值得买/头条等 Playwright 站点独立串行锁，防并发触发风控
+        _pw_lock = asyncio.Lock()
+        _pw_platforms = {"什么值得买", "头条"}
 
         async def _crawl_one(row: dict) -> str | None:
             link_id = row["link_id"]
             try:
-                async with sem:
-                    raw_content = await self.crawl_link(row)
+                use_pw_lock = row.get("platform", "") in _pw_platforms
+                if use_pw_lock:
+                    async with _pw_lock:
+                        raw_content = await self.crawl_link(row)
+                else:
+                    async with sem:
+                        raw_content = await self.crawl_link(row)
                 # 评论 Top20、超长正文 LLM 去噪、JSON 字节上限（integration/raw_content_postprocess.py）
                 raw_content = await asyncio.to_thread(
-                    postprocess_raw_for_storage, raw_content, link_id
+                    lambda: postprocess_raw_for_storage(raw_content, link_id=link_id)
                 )
                 self._save_raw_content(link_id, raw_content)
 
@@ -368,6 +380,13 @@ def _normalize_url_for_crawl(url: str) -> str:
         path = _TRAILING_PUNCT_RE.sub("", path)
         u = urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
     except Exception:
+        pass
+
+    # 平台级域名规范化（移动端→桌面端等），与 citation_parser 共享同一份规则
+    try:
+        from integration.citation_parser import normalize_url
+        u = normalize_url(u)
+    except ImportError:
         pass
     return u
 

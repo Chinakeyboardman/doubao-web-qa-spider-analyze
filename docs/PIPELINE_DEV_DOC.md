@@ -5,7 +5,7 @@ title: 'PIPELINE_DEV_DOC'
 
 # 豆包 QA 数据采集与分析系统 — 主流程开发文档
 
-> 版本：v1.1.3 · 最后更新：2026-03-19
+> 版本：v1.1.4 · 最后更新：2026-03-24
 > 维护人：chenjiawei
 
 ---
@@ -176,6 +176,7 @@ title: 'PIPELINE_DEV_DOC'
 | BilibiliCrawler | `web-crawler/crawlers/bilibili_video.py` | httpx async | 8080 API hybrid | 3 次指数退避 |
 | XiaohongshuCrawler | `web-crawler/crawlers/xiaohongshu.py` | httpx + BS4 | 直接 HTTP + SSR JSON | 3 次指数退避 |
 | GenericWebCrawler | `web-crawler/crawlers/generic_web.py` | httpx + BS4 | 直接 HTTP + HTML 解析 | 3 次指数退避 |
+| PlaywrightWebCrawler | `web-crawler/crawlers/playwright_web.py` | Playwright + stealth | JS 渲染页（头条、什么值得买等） | 什么值得买 WAF 退避重试 |
 
 ### 3.4 入库前压缩（评论 Top20、超长正文）
 
@@ -186,6 +187,28 @@ title: 'PIPELINE_DEV_DOC'
 | 评论 | 按点赞（`digg_count` 等）降序，最多 **20** 条；抖音 API 与 `douyin_comments` DB 回退一致 |
 | 超长正文 | `raw_text` / `paragraphs` 估计长度 ≥ **12 万字符** 时，用火山 **seed 模型** 去掉导航、页脚、按钮、广告等噪声，只保留主题正文；LLM 失败则硬截断 |
 | 存储 | 整份 `raw_json` 约 **6MB（UTF-8 字节）** 硬上限，降低 MySQL `max_allowed_packet` 与迁移脚本风险 |
+
+#### 3.4.1 通用网页降噪（DOM + 段落，不入 LLM 噪声）
+
+面向 **GenericWebCrawler** 与 **PlaywrightWebCrawler**（`通用` / `通用-JS` 路由）：
+
+| 层级 | 说明 |
+|------|------|
+| DOM | `_remove_noise` 在 BS4 解析后分解：`button`、`form`、`select`、`option`、`textarea`、`label`；`[role="button"]` / `navigation` / `menu` / `toolbar` / `dialog` 等；`[aria-hidden="true"]`；`.breadcrumb`、`.pagination`、`.share-bar`、`.sidebar`、`.recommend-list`、`.related-post` 等 |
+| 段落 | `web-crawler/crawlers/noise_filter.py` 中 `is_noise_paragraph()`：子串匹配（如「添加到购物袋」「复制链接」「订阅专栏」「举报成功」）+ 正则（如 `最新推荐文章于 YYYY`、点赞收藏分享栏、`首页 / … / 正文` 面包屑、`N分钟前 M人浏览` 等），不满足才进入 `paragraphs` |
+
+目的：明显为按钮/站点壳层的文本**不占段落槽位**，减少 raw 体积与 Step 3 结构化 token。
+
+#### 3.4.2 结构化与抖音回写 JSON 体积（MySQL 友好）
+
+| 项目 | 说明 |
+|------|------|
+| 函数 | `integration/raw_content_postprocess.shrink_json_object_for_storage()` |
+| 调用点 | `integration/pipeline.py` 写入 `content_json` 前（`structure` / `regenerate-content`）；`douyin_audio_transcriber._sync_to_content` 写 `raw_json` 前 |
+| 策略 | 若 `json.dumps` 的 UTF-8 超过上限，反复截断嵌套对象中最长字符串并加省略后缀，直至达标或无法再截 |
+| 配置 | 环境变量 **`QA_JSON_MAX_STORAGE_BYTES`**，默认与 raw 入库上限同档（约 6MB）；仍失败时可配合 MySQL `max_allowed_packet` 调大 |
+
+与 3.4 表中 **raw_json 6MB 硬上限** 并列：`content_json` 与含长 STT 的 `raw_json` 亦受控，避免单条 SQL 过大。
 
 **排错**：`output/error.log` 只收录 **ERROR**；近期多为 **抖音音频/ffmpeg**、通用爬取失败。**Step 3 结构化** 若失败，常见日志在终端或 `output/run_sync_*.log`，不一定写入 `error.log`。
 
@@ -668,6 +691,8 @@ python integration/run.py enrich-douyin --query-ids Q0001,Q0002
 python integration/run.py audio-transcribe --query-ids Q0001,Q0002 --audio-batch-size 5
 python integration/run.py structure --query-ids Q0001,Q0002
 python integration/run.py structure --link-ids Q0001_L001,Q0001_L002
+python integration/run.py validate-content-json              # 扫描 content_json 合规性（dry-run）
+python integration/run.py validate-content-json --apply        # 不合规 → content_json=NULL, status=error，再跑 structure
 
 # 抖音独立爬虫
 PGDATABASE=doubao node douyin-crawler/douyin-scraper.js --url https://www.douyin.com/video/xxx

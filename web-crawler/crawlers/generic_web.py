@@ -12,10 +12,25 @@ import re
 from bs4 import BeautifulSoup
 
 from .base import BaseCrawler
+from .noise_filter import is_noise_paragraph
 
 logger = logging.getLogger(__name__)
 
-_NOISE_TAGS = {"script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"}
+_NOISE_TAGS = {
+    "script", "style", "nav", "footer", "header", "aside", "iframe", "noscript",
+    "button", "select", "option", "textarea", "label", "form",
+}
+_NOISE_ROLES = {"button", "navigation", "menu", "menubar", "toolbar", "dialog", "alert", "tooltip", "banner", "complementary"}
+_NOISE_SELECTORS = [
+    '[role="button"]', '[role="navigation"]', '[role="menu"]',
+    '[role="menubar"]', '[role="toolbar"]', '[role="dialog"]',
+    '[role="alert"]', '[role="tooltip"]', '[role="banner"]',
+    '[role="complementary"]',
+    '[aria-hidden="true"]',
+    '.breadcrumb', '.pagination', '.share-btn', '.share-bar',
+    '.comment-form', '.login-form', '.toolbar',
+    '.recommend-list', '.related-post', '.sidebar',
+]
 
 
 _CSDN_CONTENT_SELECTORS = ["#article_content", "#content_views", ".article_content"]
@@ -77,6 +92,12 @@ class GenericWebCrawler(BaseCrawler):
     def _remove_noise(soup: BeautifulSoup):
         for tag in soup.find_all(_NOISE_TAGS):
             tag.decompose()
+        for sel in _NOISE_SELECTORS:
+            for el in soup.select(sel):
+                el.decompose()
+        for el in soup.find_all(attrs={"role": True}):
+            if (el.get("role") or "").lower() in _NOISE_ROLES:
+                el.decompose()
 
     @staticmethod
     def _extract_title(soup: BeautifulSoup) -> str:
@@ -94,7 +115,7 @@ class GenericWebCrawler(BaseCrawler):
         for el in candidates:
             text = el.get_text(separator=" ", strip=True)
             text = re.sub(r"\s+", " ", text).strip()
-            if len(text) >= 20 and text not in seen:
+            if len(text) >= 20 and text not in seen and not is_noise_paragraph(text):
                 seen.add(text)
                 paragraphs.append(text)
         return paragraphs

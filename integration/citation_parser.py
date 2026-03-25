@@ -2,12 +2,14 @@
 
 根据 URL 域名识别平台（抖音/B站/小红书/知乎/什么值得买/淘宝/京东/微博/头条/百度/其他），
 后续不同链接走不同解析方式见 integration/parsing_routing.py 与 docs/PARSING_ROUTING.md。
+
+URL 规范化在此处完成（识别阶段），入库即为可爬域名，爬虫不再需要额外处理。
 """
 
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 
 PLATFORM_RULES: list[tuple[list[str], str, str]] = [
@@ -26,6 +28,35 @@ PLATFORM_RULES: list[tuple[list[str], str, str]] = [
 ]
 
 _DOUYIN_VIDEO_PATTERNS = re.compile(r"/video/|/share/video/", re.I)
+
+# ---------------------------------------------------------------------------
+# URL 规范化规则（移动端 → 桌面端、错误域名修正）
+# 规则在 identify_platform / parse_citations 前执行，入库即为可爬域名。
+# ---------------------------------------------------------------------------
+_URL_NORMALIZE_RULES: list[tuple[str, str, str | None]] = [
+    # (原 host, 目标 host, 路径须含（None=任意）)
+    # 什么值得买：m.smzdm.com 移动端 → www（移动端晒物页 100% WAF）
+    ("m.smzdm.com", "www.smzdm.com", None),
+    # 什么值得买：www.smzdm.com/p/… 文章页走 post.smzdm.com（www 常 404）
+    ("www.smzdm.com", "post.smzdm.com", "/p/"),
+    # 头条移动端 → 桌面端
+    ("m.toutiao.com", "www.toutiao.com", None),
+]
+
+
+def normalize_url(url: str) -> str:
+    """将已知移动端 / 错误域名规范到可爬的桌面端域名。"""
+    try:
+        p = urlparse(url)
+        host = (p.netloc or "").lower()
+        path = p.path or ""
+        for src_host, dst_host, path_contains in _URL_NORMALIZE_RULES:
+            if host == src_host:
+                if path_contains is None or path_contains in path:
+                    return urlunparse((p.scheme, dst_host, path, p.params, p.query, p.fragment))
+    except Exception:
+        pass
+    return url
 
 
 def identify_platform(url: str) -> str:
@@ -63,6 +94,9 @@ def parse_citations(api_response) -> list[dict]:
     for ref in raw_refs:
         url = (ref.get("url") or ref.get("link") or "").strip()
         if not url or url in seen_urls:
+            continue
+        url = normalize_url(url)
+        if url in seen_urls:
             continue
         seen_urls.add(url)
 

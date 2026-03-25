@@ -124,17 +124,27 @@ class SQLBuilder:
     # JSON helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _mysql_json_path(*keys: str) -> str:
+        """JSON path for MySQL: quote each segment so Chinese keys work."""
+        if not keys:
+            return "$"
+        seg = ".".join(f'"{k}"' for k in keys)
+        return f"$.{seg}"
+
     def json_extract_text(self, col: str, key: str) -> str:
         """``col->>'key'`` / ``JSON_UNQUOTE(JSON_EXTRACT(col, '$.key'))``."""
         if self.is_pg:
             return f"{col}->>'{key}'"
-        return f"JSON_UNQUOTE(JSON_EXTRACT({col}, '$.{key}'))"
+        path = self._mysql_json_path(key)
+        return f"JSON_UNQUOTE(JSON_EXTRACT({col}, '{path}'))"
 
     def json_extract(self, col: str, key: str) -> str:
         """``col->'key'`` / ``JSON_EXTRACT(col, '$.key')``."""
         if self.is_pg:
             return f"{col}->'{key}'"
-        return f"JSON_EXTRACT({col}, '$.{key}')"
+        path = self._mysql_json_path(key)
+        return f"JSON_EXTRACT({col}, '{path}')"
 
     def json_extract_path_text(self, col: str, *keys: str) -> str:
         """Deep path extraction: ``col->'a'->>'b'`` / ``JSON_UNQUOTE(JSON_EXTRACT(col, '$.a.b'))``."""
@@ -143,16 +153,16 @@ class SQLBuilder:
             if parts:
                 return f"{col}->{parts}->>'{keys[-1]}'"
             return f"{col}->>'{keys[-1]}'"
-        path = ".".join(keys)
-        return f"JSON_UNQUOTE(JSON_EXTRACT({col}, '$.{path}'))"
+        path = self._mysql_json_path(*keys)
+        return f"JSON_UNQUOTE(JSON_EXTRACT({col}, '{path}'))"
 
     def json_extract_path(self, col: str, *keys: str) -> str:
         """Deep path extraction without unquote."""
         if self.is_pg:
             parts = "->".join(f"'{k}'" for k in keys)
             return f"{col}->{parts}"
-        path = ".".join(keys)
-        return f"JSON_EXTRACT({col}, '$.{path}')"
+        path = self._mysql_json_path(*keys)
+        return f"JSON_EXTRACT({col}, '{path}')"
 
     def json_array_length(self, expr: str) -> str:
         """``jsonb_array_length(expr)`` / ``JSON_LENGTH(expr)``."""
@@ -164,7 +174,8 @@ class SQLBuilder:
         """``col ? 'key'`` / ``JSON_CONTAINS_PATH(col, 'one', '$.key')``."""
         if self.is_pg:
             return f"{col} ? '{key}'"
-        return f"JSON_CONTAINS_PATH({col}, 'one', '$.{key}')"
+        path = self._mysql_json_path(key)
+        return f"JSON_CONTAINS_PATH({col}, 'one', '{path}')"
 
     def json_cast(self, literal: str) -> str:
         """``'[]'::jsonb`` / ``CAST('[]' AS JSON)``."""

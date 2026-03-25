@@ -105,14 +105,33 @@ def _generate_bezier_path(
     return points
 
 
-async def _human_like_slide_drag(page, start_x: float, start_y: float, distance: float):
-    """滑块缓动拖拽：easeOutCubic + Y 轴抖动 + 末尾过冲回正。"""
+async def human_like_horizontal_slide(
+    page,
+    start_x: float,
+    start_y: float,
+    distance: float,
+    *,
+    total_time_ms: float | None = None,
+    steps: int | None = None,
+    y_jitter: float = 4.0,
+    overshoot_px: float | None = None,
+) -> None:
+    """水平滑块：easeOutCubic + Y 抖动 + 末尾微回拉（与豆包验证码同曲线）。
+
+    *total_time_ms* / *steps* 为 None 时使用豆包默认节奏；腾讯 WAF 等场景请传入更慢参数
+    （如 total_time_ms=3000~4500, steps=60~90），避免「滑太快」被拒。
+    """
     direction = 1 if distance >= 0 else -1
     abs_dist = max(abs(distance), 10)
-    total_time = 900 + random.random() * 400
-    steps = 30 + int(random.random() * 20)
+    if total_time_ms is None:
+        total_time_ms = 900 + random.random() * 400
+    if steps is None:
+        steps = 30 + int(random.random() * 20)
+    if overshoot_px is None:
+        overshoot_px = 3 + random.random() * 3
 
     await page.mouse.move(start_x, start_y)
+    await page.wait_for_timeout(int(80 + random.random() * 120))
     await page.mouse.down()
 
     prev_x, prev_y = start_x, start_y
@@ -122,7 +141,7 @@ async def _human_like_slide_drag(page, start_x: float, start_y: float, distance:
         t = i / steps
         eased = _ease_out_cubic(t)
         target_x = start_x + direction * abs_dist * eased
-        jitter_y = (random.random() - 0.5) * 4
+        jitter_y = (random.random() - 0.5) * 2 * y_jitter
         next_y = start_y + jitter_y
         dx = target_x - prev_x
         dy = next_y - prev_y
@@ -132,18 +151,22 @@ async def _human_like_slide_drag(page, start_x: float, start_y: float, distance:
         prev_y += dy
 
         elapsed = (__import__("time").time() - start_time) * 1000
-        remaining = total_time - elapsed
+        remaining = total_time_ms - elapsed
         remaining_steps = steps - i
-        sleep_ms = max(5, remaining / remaining_steps) if remaining_steps > 0 else 0
+        sleep_ms = max(8, remaining / remaining_steps) if remaining_steps > 0 else 0
         if sleep_ms > 0:
             await page.wait_for_timeout(int(sleep_ms))
 
-    adjust = 3 + random.random() * 3
-    await page.mouse.move(prev_x - direction * adjust, prev_y, steps=3)
-    await page.wait_for_timeout(int(80 + random.random() * 120))
-    await page.mouse.move(prev_x, prev_y, steps=2)
-    await page.wait_for_timeout(int(120 + random.random() * 180))
+    await page.mouse.move(prev_x - direction * overshoot_px, prev_y, steps=4)
+    await page.wait_for_timeout(int(100 + random.random() * 150))
+    await page.mouse.move(prev_x, prev_y, steps=3)
+    await page.wait_for_timeout(int(150 + random.random() * 200))
     await page.mouse.up()
+
+
+async def _human_like_slide_drag(page, start_x: float, start_y: float, distance: float):
+    """滑块缓动拖拽：easeOutCubic + Y 轴抖动 + 末尾过冲回正。"""
+    await human_like_horizontal_slide(page, start_x, start_y, distance)
 
 
 async def _human_like_bezier_drag(
